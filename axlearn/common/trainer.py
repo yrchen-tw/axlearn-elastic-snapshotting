@@ -1137,7 +1137,18 @@ class SpmdTrainer(Module):
             )
 
     def save_snapshot(self, evaler_summaries: Optional[dict[str, Any]] = None, *, force: bool = False):
-        if "snapshotter" in self.children and (force or not self._is_checkpoint_saving_in_progress()):
+        # Skip snapshots on checkpoint steps to bound host memory.
+        ckpt_every_n = getattr(getattr(self.config.checkpointer, "save_policy", None), "n", None)
+        is_ckpt_step = bool(ckpt_every_n) and self.step % ckpt_every_n == 0
+        if "snapshotter" in self.children and not force and is_ckpt_step:
+            logging.info(
+                "[ELASTIC] Step %s is a checkpoint step (every %s). Skipping snapshot to bound host memory.",
+                self.step,
+                ckpt_every_n,
+            )
+        if "snapshotter" in self.children and (
+            force or not (is_ckpt_step or self._is_checkpoint_saving_in_progress())
+        ):
             self.save_checkpoint(evaler_summaries, checkpointer=self.snapshotter, force=force)
 
     def _restore_from_builder(self) -> Optional[TrainerStateBuilder.State]:
