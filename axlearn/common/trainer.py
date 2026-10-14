@@ -287,6 +287,10 @@ class SpmdTrainer(Module):
         self._is_initialized: bool = False
         self._init_prng_key: Optional[Tensor] = None
         self._base_grad_accum_steps: int = _get_base_grad_accum_steps(cfg)
+        # Set by `_run_step` before it raises `ScaleUpSignalError`.
+        self._scale_up_requested: bool = False
+        # The event type of the pending elastic wait, if any.
+        self._elastic_wait_event_type: Optional[str] = None
         elastic_utils.ensure_elastic_manager_initialized(cfg.elastic_enabled)
         self._maybe_record_event(measurement.Event.START_ACCELERATOR_INIT)
 
@@ -497,6 +501,22 @@ class SpmdTrainer(Module):
         if (mgr := elastic_utils.elastic_manager) is None:
             return
         jax.config.update("jax_default_device", mgr.default_device)
+        self._record_slice_counts()
+
+    def _record_slice_counts(self, *, stepping: bool = True):
+        """Records the slice counts. No slice is stepping during an elastic event."""
+        if (mgr := elastic_utils.elastic_manager) is None:
+            return
+        active_slices = mgr.active_slice_count if stepping else 0
+        available_slices = None if stepping else elastic_utils.available_slice_count()
+        self._maybe_record_event(
+            measurement.Event.RECORD_SLICE_COUNTS,
+            active_slices=active_slices,
+            total_slices=mgr.total_slice_count,
+            available_slices=(
+                mgr.active_slice_count if available_slices is None else available_slices
+            ),
+        )
 
     def _reconfigure_elastic_mesh(self, live_devs: Sequence[jax.Device]) -> int:
         device_batch_sizes = (
@@ -565,8 +585,18 @@ class SpmdTrainer(Module):
 
     def _on_elastic_event(self):
         self._trainer_state = None
+        # Goodput classifies the wait by its type, and pairs its start and end by type.
+        self._elastic_wait_event_type = (
+            "elastic_scale_up" if self._scale_up_requested else "elastic_slice_down"
+        )
+        self._scale_up_requested = False
+        self._maybe_record_event(
+            measurement.Event.START_ELASTIC_WAIT, self._elastic_wait_event_type
+        )
         if hasattr(self.checkpointer, "begin_elastic_drain"):
             self.checkpointer.begin_elastic_drain()
+        # Probing the slice health takes time, so let the checkpoint drain start first.
+        self._record_slice_counts(stepping=False)
 
     def _restore_after_elastic_event(self):
         live_devs = elastic_utils.live_devices()
@@ -575,6 +605,12 @@ class SpmdTrainer(Module):
         }
         if self._trainer_state is not None and not devices_changed:
             return
+        if self._elastic_wait_event_type is not None:
+            self._maybe_record_event(
+                measurement.Event.END_ELASTIC_WAIT, self._elastic_wait_event_type
+            )
+            self._elastic_wait_event_type = None
+        self._maybe_record_event(measurement.Event.START_ELASTIC_REINIT)
         self._sync_elastic_devices()
         if devices_changed:
             steps = self._reconfigure_elastic_mesh(live_devs)
@@ -609,7 +645,8 @@ class SpmdTrainer(Module):
                 and elastic_utils.elastic_manager.active_slice_count > 1
             ):
                 self.save_snapshot(force=True)
-
+        self._maybe_record_event(measurement.Event.END_ELASTIC_REINIT)
+        self._record_slice_counts()
 
     @contextlib.contextmanager
     def _watchdog(self):
@@ -1400,6 +1437,7 @@ class SpmdTrainer(Module):
         ):
             self.save_snapshot(evaler_summaries=evaler_summaries, force=True)
             self._step_log("[ELASTIC] New slice ready at step=%s; triggering scale-up", self.step)
+            self._scale_up_requested = True
             raise elastic_utils.ScaleUpSignalError(f"Scale-up at step {self.step}")
         # Checkpointer policy will decide if we should save.
         self.save_checkpoint(evaler_summaries=evaler_summaries)
