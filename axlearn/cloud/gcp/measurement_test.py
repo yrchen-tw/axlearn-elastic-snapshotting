@@ -628,6 +628,54 @@ class GoodputRecorderTest(parameterized.TestCase):
                 pass
             mock_monitor_cls.assert_called_once()
 
+    @parameterized.parameters(dict(has_dedicated_methods=True), dict(has_dedicated_methods=False))
+    @mock.patch("jax.process_index", return_value=0)
+    def test_record_data_iterator_init_and_checkpoint_restore(self, _, has_dedicated_methods):
+        """Tests the dedicated recorder methods and the custom badput fallback."""
+        cfg = GoodputRecorder.default_config().set(
+            name="test-dedicated", upload_dir="/test", upload_interval=30
+        )
+        recorder = GoodputRecorder(cfg)
+        with mock.patch(
+            "ml_goodput_measurement.src.goodput_elastic.ElasticGoodputRecorder"
+        ) as mock_recorder_cls:
+            mock_instance = mock_recorder_cls.return_value
+            if not has_dedicated_methods:
+                del mock_instance.record_data_iterator_init_start_time
+                del mock_instance.record_data_iterator_init_end_time
+                del mock_instance.record_checkpoint_restore_start_time
+                del mock_instance.record_checkpoint_restore_end_time
+            recorder.record(measurement.Event.START_DATA_ITERATOR_INIT)
+            recorder.record(measurement.Event.END_DATA_ITERATOR_INIT)
+            recorder.record(measurement.Event.START_CHECKPOINT_RESTORE, source="snapshot", step=10)
+            recorder.record(measurement.Event.END_CHECKPOINT_RESTORE, source="snapshot", step=10)
+            if has_dedicated_methods:
+                mock_instance.record_data_iterator_init_start_time.assert_called_once_with()
+                mock_instance.record_data_iterator_init_end_time.assert_called_once_with()
+                mock_instance.record_checkpoint_restore_start_time.assert_called_once_with(
+                    source="snapshot", step=10
+                )
+                mock_instance.record_checkpoint_restore_end_time.assert_called_once_with(
+                    source="snapshot", step=10
+                )
+                mock_instance.record_custom_badput_event_start_time.assert_not_called()
+            else:
+                # The custom events are named after the bucket and the restore source.
+                self.assertEqual(
+                    [
+                        mock.call(custom_badput_event_type="DATA_ITERATOR_INIT"),
+                        mock.call(custom_badput_event_type="SNAPSHOT_RESTORE"),
+                    ],
+                    mock_instance.record_custom_badput_event_start_time.call_args_list,
+                )
+                self.assertEqual(
+                    [
+                        mock.call(custom_badput_event_type="DATA_ITERATOR_INIT"),
+                        mock.call(custom_badput_event_type="SNAPSHOT_RESTORE"),
+                    ],
+                    mock_instance.record_custom_badput_event_end_time.call_args_list,
+                )
+
     @mock.patch("jax.process_index", return_value=0)
     def test_maybe_monitor_all_reentrant(self, _):
         """Tests that only the outermost monitoring context starts and stops the uploaders."""

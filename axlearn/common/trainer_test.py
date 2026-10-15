@@ -791,12 +791,20 @@ class TrainerTest(test_utils.TestCase):
             (c.args[0], c.kwargs.get("custom_badput_event_type"))
             for c in recorder.record.call_args_list
         ]
-        data_iter_init = [i for i, e in enumerate(events) if e[1] == "DATA_ITERATOR_INIT"]
+        data_iter_init = [
+            i
+            for i, e in enumerate(events)
+            if e[0]
+            in (
+                measurement.Event.START_DATA_ITERATOR_INIT,
+                measurement.Event.END_DATA_ITERATOR_INIT,
+            )
+        ]
         # At init, then at restore (during the training preparation), before the first step.
         self.assertEqual(
             [
-                measurement.Event.START_CUSTOM_BADPUT_EVENT,
-                measurement.Event.END_CUSTOM_BADPUT_EVENT,
+                measurement.Event.START_DATA_ITERATOR_INIT,
+                measurement.Event.END_DATA_ITERATOR_INIT,
             ]
             * 2,
             [events[i][0] for i in data_iter_init],
@@ -1472,7 +1480,9 @@ class ElasticGoodputEventsTest(test_utils.TestCase):
         trainer.children = {"snapshotter": trainer.snapshotter}
         trainer.snapshotter.latest_snapshot_step = 10
         trainer.checkpointer.checkpoint_steps.return_value = ckpt_steps
-        trainer._restore_snapshot.side_effect = lambda: SpmdTrainer._restore_snapshot(trainer)
+        trainer._restore_snapshot.side_effect = lambda **kw: SpmdTrainer._restore_snapshot(
+            trainer, **kw
+        )
         trainer.restore_checkpoint.side_effect = RuntimeError if restore_raises else None
         device = unittest.mock.MagicMock(id=0)
         trainer._mesh.devices.flat = [device]
@@ -1485,11 +1495,14 @@ class ElasticGoodputEventsTest(test_utils.TestCase):
         snapshot_events = [
             c.args[0].value.split("_")[0]
             for c in trainer._maybe_record_event.call_args_list
-            if c.kwargs.get("custom_badput_event_type") == "SNAPSHOT_RESTORE"
+            if c.kwargs.get("source") == "snapshot"
         ]
         self.assertEqual(expected, snapshot_events)
         if expected:
             trainer.restore_checkpoint.assert_any_call(checkpointer=trainer.snapshotter)
+            trainer._maybe_record_event.assert_any_call(
+                measurement.Event.START_CHECKPOINT_RESTORE, source="snapshot", step=10
+            )
             # Within the elastic reinitialization.
             self.assertEqual(measurement.Event.START_ELASTIC_REINIT, events[0])
         if expected == ["START", "END"]:
@@ -1505,13 +1518,10 @@ class ElasticGoodputEventsTest(test_utils.TestCase):
         # Also recorded after training started, e.g. when restoring on an elastic event.
         self.assertEqual(
             [
-                (measurement.Event.START_CUSTOM_BADPUT_EVENT, "DATA_ITERATOR_INIT"),
-                (measurement.Event.END_CUSTOM_BADPUT_EVENT, "DATA_ITERATOR_INIT"),
+                unittest.mock.call(measurement.Event.START_DATA_ITERATOR_INIT),
+                unittest.mock.call(measurement.Event.END_DATA_ITERATOR_INIT),
             ],
-            [
-                (c.args[0], c.kwargs["custom_badput_event_type"])
-                for c in trainer._maybe_record_event.call_args_list
-            ],
+            trainer._maybe_record_event.call_args_list,
         )
 
     @parameterized.parameters(

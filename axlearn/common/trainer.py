@@ -535,7 +535,7 @@ class SpmdTrainer(Module):
             snap_step = self.snapshotter.latest_snapshot_step if "snapshotter" in self.children else None
             ckpt_step = max(self.checkpointer.checkpoint_steps(self.checkpointer.config.dir), default=0) if hasattr(self.checkpointer, "checkpoint_steps") else 0
             restored_step = (
-                self._restore_snapshot()
+                self._restore_snapshot(step=snap_step)
                 if snap_step is not None and snap_step >= ckpt_step
                 else None
             ) or self.restore_checkpoint()
@@ -547,8 +547,11 @@ class SpmdTrainer(Module):
         self._maybe_record_event(measurement.Event.END_ELASTIC_REINIT)
         self._record_slice_counts()
 
-    def _restore_snapshot(self) -> Optional[int]:
+    def _restore_snapshot(self, *, step: int) -> Optional[int]:
         """Restores the trainer state from the latest in-memory snapshot.
+
+        Args:
+            step: The step of the latest snapshot.
 
         Returns:
             The restored step or None (if no usable snapshot is found).
@@ -556,15 +559,13 @@ class SpmdTrainer(Module):
         # Orbax logs checkpoint restores, but nothing logs snapshot restores. If the restore
         # raises, the start stays unpaired and is ignored.
         self._maybe_record_event(
-            measurement.Event.START_CUSTOM_BADPUT_EVENT,
-            custom_badput_event_type="SNAPSHOT_RESTORE",
+            measurement.Event.START_CHECKPOINT_RESTORE, source="snapshot", step=step
         )
-        step = self.restore_checkpoint(checkpointer=self.snapshotter)
+        restored_step = self.restore_checkpoint(checkpointer=self.snapshotter)
         self._maybe_record_event(
-            measurement.Event.END_CUSTOM_BADPUT_EVENT,
-            custom_badput_event_type="SNAPSHOT_RESTORE",
+            measurement.Event.END_CHECKPOINT_RESTORE, source="snapshot", step=step
         )
-        return step
+        return restored_step
 
     @contextlib.contextmanager
     def _watchdog(self):
@@ -1101,17 +1102,11 @@ class SpmdTrainer(Module):
 
     def _create_input_iterator(self) -> Iterator:
         """Returns a new iterator of the training input."""
-        # Recorded on every call, also within an elastic reinitialization: ml-goodput-measurement
-        # ignores custom badput outside of steps, so this does not double count the (re)init.
-        self._maybe_record_event(
-            measurement.Event.START_CUSTOM_BADPUT_EVENT,
-            custom_badput_event_type="DATA_ITERATOR_INIT",
-        )
+        # Recorded on every call, also within an elastic reinitialization, where it is nested in
+        # the reinit event.
+        self._maybe_record_event(measurement.Event.START_DATA_ITERATOR_INIT)
         input_iter = iter(self.input.dataset())
-        self._maybe_record_event(
-            measurement.Event.END_CUSTOM_BADPUT_EVENT,
-            custom_badput_event_type="DATA_ITERATOR_INIT",
-        )
+        self._maybe_record_event(measurement.Event.END_DATA_ITERATOR_INIT)
         return input_iter
 
     def restore_checkpoint(self, restore_step: Optional[int] = None, *, checkpointer: Optional[BaseCheckpointer] = None) -> Optional[int]:

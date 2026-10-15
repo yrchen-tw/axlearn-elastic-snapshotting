@@ -426,6 +426,27 @@ class GoodputRecorder(measurement_base.Recorder):
         elif event == measurement_base.Event.END_CUSTOM_BADPUT_EVENT:
             self._recorder.record_custom_badput_event_end_time(*args, **kwargs)
         elif method_name := {
+            measurement_base.Event.START_DATA_ITERATOR_INIT: "record_data_iterator_init_start_time",
+            measurement_base.Event.END_DATA_ITERATOR_INIT: "record_data_iterator_init_end_time",
+            measurement_base.Event.START_CHECKPOINT_RESTORE: "record_checkpoint_restore_start_time",
+            measurement_base.Event.END_CHECKPOINT_RESTORE: "record_checkpoint_restore_end_time",
+        }.get(event):
+            if (fn := getattr(self._recorder, method_name, None)) is not None:
+                fn(*args, **kwargs)
+            else:
+                # Older ml-goodput-measurement releases have no dedicated method: record the same
+                # interval as a custom badput event named after the bucket, e.g. DATA_ITERATOR_INIT
+                # or SNAPSHOT_RESTORE. Custom badput takes no other kwargs.
+                is_start, custom_type = event.value.split("_", 1)
+                if "source" in kwargs:
+                    custom_type = f"{kwargs['source'].upper()}_RESTORE"
+                record_fn = (
+                    self._recorder.record_custom_badput_event_start_time
+                    if is_start == "START"
+                    else self._recorder.record_custom_badput_event_end_time
+                )
+                record_fn(custom_badput_event_type=custom_type)
+        elif method_name := {
             measurement_base.Event.START_ELASTIC_WAIT: "record_elastic_wait_start_time",
             measurement_base.Event.END_ELASTIC_WAIT: "record_elastic_wait_end_time",
             measurement_base.Event.START_ELASTIC_REINIT: "record_elastic_reinit_start_time",
