@@ -167,10 +167,20 @@ Besides the job, step, accelerator initialization, training preparation and data
 | Evaluation | Custom badput `EVAL`, at steps where an evaler ran. |
 
 The snapshot restore and input iterator events use the dedicated recorder methods when the
-installed ml-goodput-measurement has them. Older releases (up to 0.2.3) record them as the custom
-badput events `SNAPSHOT_RESTORE` and `DATA_ITERATOR_INIT` instead; these releases only count custom
-badput within steps, so the events are informational there and can be mapped onto the same buckets
-by log consumers such as the goodput timeline.
+installed ml-goodput-measurement has them. Released versions (up to 0.2.3) do not, so the recorder
+writes the same entries itself (`data_iterator_init_*`, and `checkpoint_restore_*` with
+`checkpoint_restore_source` and `checkpoint_restore_step`) through the library's Cloud Logging
+writer. These releases ignore the entries, so goodput is unchanged; log consumers such as the
+goodput timeline read them as the data iterator initialization and the checkpoint restore of a
+recovery. Only a recorder without that writer records them as the custom badput events
+`DATA_ITERATOR_INIT` and `SNAPSHOT_RESTORE`.
+
+> [!NOTE]
+> Older releases count custom badput only between two step starts. 0.2.3 does not treat an
+> in-place elastic recovery as a restart, so a custom `SNAPSHOT_RESTORE` within it was counted as
+> custom badput; the explicit entries are not counted, so the goodput that the job uploads with 0.2.3
+> can be slightly higher than before. Versions that detect in-place elastic restarts (the
+> ml-goodput-measurement main branch) count neither, so their goodput is the same either way.
 
 ### Checkpoint Badput
 
