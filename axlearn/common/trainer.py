@@ -290,6 +290,11 @@ class SpmdTrainer(Module):
         # The event type of the pending elastic wait, if any.
         self._elastic_wait_event_type: Optional[str] = None
         elastic_utils.ensure_elastic_manager_initialized(cfg.elastic_enabled)
+        if devices is None:
+            # All slices must be active at startup. Like MaxText, which waits for the slices
+            # before its setup records tpu_init, waiting for the slices (e.g. for the worker pods to
+            # start) is not part of the accelerator initialization. A no-op when not elastic.
+            elastic_utils.wait_for_slices()
         self._maybe_record_event(measurement.Event.START_ACCELERATOR_INIT)
 
         if cfg.model.dtype is None:
@@ -307,7 +312,6 @@ class SpmdTrainer(Module):
 
         # Create the device mesh.
         if devices is None:
-            elastic_utils.wait_for_slices()  # All slices must be active at startup.
             self._sync_elastic_devices()
             live_devs = elastic_utils.live_devices()
             self._step_log(

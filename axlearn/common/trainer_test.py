@@ -768,9 +768,11 @@ class TrainerTest(test_utils.TestCase):
             [e for e in events if "TRAINING_PREPARATION" in e.value],
         )
 
-    def test_data_iterator_init_goodput_events(self):
+    @parameterized.parameters(dict(save_input_iterator=False), dict(save_input_iterator=True))
+    def test_data_iterator_init_goodput_events(self, save_input_iterator: bool):
         """Tests that the creation of the input iterators is recorded."""
         cfg = SpmdTrainer.default_config().set(name="test_data_iterator_init_trainer")
+        cfg.save_input_iterator = save_input_iterator
         cfg.dir = tempfile.mkdtemp()
         cfg.mesh_axis_names = ("data", "model")
         cfg.mesh_shape = (1, 1)
@@ -800,19 +802,49 @@ class TrainerTest(test_utils.TestCase):
                 measurement.Event.END_DATA_ITERATOR_INIT,
             )
         ]
-        # At init, then at restore (during the training preparation), before the first step.
+        # At init, then, if the input iterator is restored, at restore (during the training
+        # preparation), before the first step.
         self.assertEqual(
             [
                 measurement.Event.START_DATA_ITERATOR_INIT,
                 measurement.Event.END_DATA_ITERATOR_INIT,
             ]
-            * 2,
+            * (2 if save_input_iterator else 1),
             [events[i][0] for i in data_iter_init],
         )
         prep_start = events.index((measurement.Event.START_TRAINING_PREPARATION, None))
         self.assertLess(data_iter_init[1], prep_start)
-        self.assertLess(prep_start, data_iter_init[2])
+        if save_input_iterator:
+            self.assertLess(prep_start, data_iter_init[2])
         self.assertLess(data_iter_init[-1], events.index((measurement.Event.START_STEP, None)))
+
+    def test_wait_for_slices_before_accelerator_init(self):
+        """Tests that waiting for the slices at startup is not accelerator initialization."""
+        cfg = SpmdTrainer.default_config().set(name="test_wait_for_slices_trainer")
+        cfg.dir = tempfile.mkdtemp()
+        cfg.mesh_axis_names = ("data", "model")
+        cfg.mesh_shape = (1, 1)
+        cfg.model = DummyModel.default_config().set(dtype=jnp.float32)
+        cfg.input = DummyInput.default_config()
+        cfg.learner = learner.Learner.default_config().set(
+            optimizer=config_for_function(optimizers.sgd_optimizer).set(
+                learning_rate=0.1, decouple_weight_decay=True
+            )
+        )
+        calls = []
+        recorder = unittest.mock.MagicMock()
+        recorder.record.side_effect = lambda event, *args, **kwargs: calls.append(event)
+        cfg.recorder = config_for_function(lambda: recorder)
+        with unittest.mock.patch.object(
+            elastic_utils, "wait_for_slices", side_effect=lambda: calls.append("wait_for_slices")
+        ):
+            cfg.instantiate(parent=None)
+        # As in MaxText, the accelerator initialization starts once the slices are active.
+        self.assertEqual(
+            ["wait_for_slices", measurement.Event.START_ACCELERATOR_INIT],
+            calls[: calls.index(measurement.Event.START_ACCELERATOR_INIT) + 1],
+        )
+        self.assertIn(measurement.Event.END_ACCELERATOR_INIT, calls)
 
     def test_stop_on_exception(self):
         """Test that trainer exits cleanly if there's an exception in the main loop."""
