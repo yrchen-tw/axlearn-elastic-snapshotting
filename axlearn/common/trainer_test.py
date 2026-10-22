@@ -1508,6 +1508,67 @@ class ElasticGoodputEventsTest(test_utils.TestCase):
         if expected == ["START", "END"]:
             self.assertEqual(measurement.Event.END_ELASTIC_REINIT, events[-1])
 
+    @parameterized.parameters(
+        dict(snapshot=True, active_slice_count=2),
+        # Restored from the checkpoint; with a single slice, no snapshot is saved.
+        dict(snapshot=False, active_slice_count=1),
+    )
+    def test_reinit_setup_events(self, snapshot: bool, active_slice_count: int):
+        """Tests the accelerator init and training preparation nested in the reinitialization."""
+        trainer = unittest.mock.MagicMock()
+        trainer._trainer_state = None
+        trainer._elastic_wait_event_type = "elastic_slice_down"
+        trainer.children = {"snapshotter": trainer.snapshotter} if snapshot else {}
+        trainer.snapshotter.latest_snapshot_step = 10
+        trainer.checkpointer.checkpoint_steps.return_value = [5]
+        trainer._restore_snapshot.return_value = 10
+        trainer.restore_checkpoint.return_value = 5
+        device = unittest.mock.MagicMock(id=0)
+        trainer._mesh.devices.flat = [device]
+        manager = unittest.mock.MagicMock(active_slice_count=active_slice_count)
+        with (
+            unittest.mock.patch.object(elastic_utils, "live_devices", return_value=[device]),
+            unittest.mock.patch.object(elastic_utils, "elastic_manager", manager),
+        ):
+            SpmdTrainer._restore_after_elastic_event(trainer)
+
+        # Records the events and the steps of the reinitialization in the order they happen.
+        def name(c) -> Optional[str]:
+            method, args, _ = c
+            if method == "_maybe_record_event" and args[0] != measurement.Event.RECORD_SLICE_COUNTS:
+                return args[0].value
+            if method in (
+                "_sync_elastic_devices",
+                "checkpointer.reset_after_elastic_event",
+                "_restore_snapshot",
+                "restore_checkpoint",
+                "save_snapshot",
+            ):
+                return method
+            return None
+
+        restore = "_restore_snapshot" if snapshot else "restore_checkpoint"
+        saves = ["save_snapshot"] if active_slice_count > 1 else []
+        self.assertEqual(
+            [
+                "END_ELASTIC_WAIT",
+                "START_ELASTIC_REINIT",
+                "START_ACCELERATOR_INIT",
+                "_sync_elastic_devices",
+                "END_ACCELERATOR_INIT",
+                "START_TRAINING_PREPARATION",
+                "checkpointer.reset_after_elastic_event",
+                restore,
+                "END_TRAINING_PREPARATION",
+                # Like MaxText, the snapshot is saved after the training preparation.
+                *saves,
+                "END_ELASTIC_REINIT",
+            ],
+            [n for n in map(name, trainer.mock_calls) if n is not None],
+        )
+        if active_slice_count > 1:
+            trainer.save_snapshot.assert_called_once_with(force=True)
+
     @parameterized.parameters(dict(initialized=False), dict(initialized=True))
     def test_create_input_iterator(self, initialized: bool):
         trainer = unittest.mock.MagicMock()

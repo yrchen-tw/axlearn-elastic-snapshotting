@@ -495,6 +495,12 @@ class SpmdTrainer(Module):
 
         Rebuilds the mesh on the live devices (keeping the global batch via gradient accumulation)
         and restores the trainer state from the latest snapshot or checkpoint.
+
+        Within the elastic reinitialization, the mesh rebuild is recorded as accelerator
+        initialization and the restore as training preparation, as MaxText does when it reruns its
+        setup on an elastic event. Goodput tools such as the goodput timeline break the recovery
+        down by these events; ml-goodput-measurement discounts their overlap with the elastic
+        reinitialization, so they are not counted twice.
         """
         live_devs = elastic_utils.live_devices()
         devices_changed = self._mesh is not None and {d.id for d in live_devs} != {d.id for d in self._mesh.devices.flat}
@@ -506,6 +512,7 @@ class SpmdTrainer(Module):
             )
             self._elastic_wait_event_type = None
         self._maybe_record_event(measurement.Event.START_ELASTIC_REINIT)
+        self._maybe_record_event(measurement.Event.START_ACCELERATOR_INIT)
         self._sync_elastic_devices()
         if devices_changed:
             # pylint: disable-next=import-outside-toplevel
@@ -529,6 +536,8 @@ class SpmdTrainer(Module):
                 self._jit_train_step = self._pjit_train_step()
         else:
             self._step_log("[ELASTIC][SCALE] devices=%s unchanged; reusing mesh and compiled train step.", len(live_devs))
+        self._maybe_record_event(measurement.Event.END_ACCELERATOR_INIT)
+        self._maybe_record_event(measurement.Event.START_TRAINING_PREPARATION)
         if hasattr(self.checkpointer, "reset_after_elastic_event"):
             self.checkpointer.reset_after_elastic_event(devices_changed=devices_changed)
         with self.mesh():
@@ -542,6 +551,9 @@ class SpmdTrainer(Module):
             if restored_step is None:
                 self.init(jnp.asarray(self._init_prng_key))
                 self._step = 0
+            self._maybe_record_event(measurement.Event.END_TRAINING_PREPARATION)
+            # Like MaxText, which saves the first snapshot after a recovery outside of its setup
+            # events, the snapshot is saved after the training preparation.
             if elastic_utils.elastic_manager and elastic_utils.elastic_manager.active_slice_count > 1:
                 self.save_snapshot(force=True)
         self._maybe_record_event(measurement.Event.END_ELASTIC_REINIT)

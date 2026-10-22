@@ -159,6 +159,7 @@ Besides the job, step, accelerator initialization, training preparation and data
 |---|---|
 | Elastic wait | `elastic_wait_event_type` `elastic_scale_up` (after a cooperative scale-up) or `elastic_slice_down`, from the elastic event until the slices are back. |
 | Elastic reinitialization | `elastic_reinit_*`, from the end of the wait until training can resume. |
+| Setup within the reinitialization | `tpu_init_*` around the mesh rebuild and `training_prep_*` around the restore, nested in `elastic_reinit_*` as in MaxText, which reruns its setup on elastic events. The snapshot saved after the restore follows the training preparation. ml-goodput-measurement (0.2.3 included) discounts their overlap with the reinitialization, so they are not counted twice; recovery breakdowns such as the goodput timeline use them to split the reinitialization. |
 | Slice counts | `active_slices`/`available_slices`/`total_slices` at startup, at the start of an elastic event (0 active slices) and at the start and end of the reinitialization. |
 | Snapshot restore | `checkpoint_restore_*` with `source=snapshot` and the snapshot step, around the in-memory snapshot restore on elastic events. |
 | Input iterator creation | `data_iterator_init_*` at init and at every restore. |
