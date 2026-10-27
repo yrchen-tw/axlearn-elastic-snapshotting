@@ -159,15 +159,18 @@ Besides the job, step, accelerator initialization, training preparation and data
 |---|---|
 | Elastic wait | `elastic_wait_event_type` `elastic_scale_up` (after a cooperative scale-up) or `elastic_slice_down`, from the elastic event until the slices are back. |
 | Elastic reinitialization | `elastic_reinit_*`, from the end of the wait until training can resume. |
+| Setup within the reinitialization | `tpu_init_*` around the mesh rebuild and `training_prep_*` around the restore, nested in `elastic_reinit_*` as in MaxText, which reruns its setup on elastic events. The snapshot saved after the restore follows the training preparation. ml-goodput-measurement discounts their overlap with the reinitialization, so they are not counted twice; recovery breakdowns such as the goodput timeline use them to split the reinitialization. |
 | Slice counts | `active_slices`/`available_slices`/`total_slices` at startup, at the start of an elastic event (0 active slices) and at the start and end of the reinitialization. |
 | Snapshot restore | Custom badput `SNAPSHOT_RESTORE` around the in-memory snapshot restore on elastic events. |
-| Input iterator creation | Custom badput `DATA_ITERATOR_INIT` at init and at every restore. |
+| Input iterator creation | Custom badput `DATA_ITERATOR_INIT` at init, and when a checkpoint restore rebuilds the iterator (`save_input_iterator`). |
 | Compilation | Custom badput `COMPILATION_NO_XSC` / `COMPILATION_WITH_XSC`. |
 | Evaluation | Custom badput `EVAL`, at steps where an evaler ran. |
 
-ml-goodput-measurement only counts custom badput within steps; custom events outside of steps (e.g.
-`SNAPSHOT_RESTORE`, `DATA_ITERATOR_INIT`) are informational and are reported by tools such as the
-goodput timeline.
+ml-goodput-measurement has no events for the snapshot restore and the input iterator creation, so
+they are recorded as custom badput. The library counts custom badput between two step starts;
+versions that detect in-place elastic restarts do not count `SNAPSHOT_RESTORE` and
+`DATA_ITERATOR_INIT`, which are outside of steps, and tools such as the goodput timeline report
+them.
 
 ### Checkpoint Badput
 
