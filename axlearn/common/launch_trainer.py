@@ -10,7 +10,9 @@ import jax
 from absl import flags, logging
 
 from axlearn.common import file_system as fs
-from axlearn.common import measurement
+from axlearn.common import measurement, snapshot
+from axlearn.common.checkpointer import Checkpointer
+from axlearn.common.checkpointer_orbax import OrbaxCheckpointer
 from axlearn.common.config import TrainerConfigFn, get_named_trainer_config
 from axlearn.common.trainer import SpmdTrainer, select_mesh_config
 from axlearn.common.utils import MeshShape, get_data_dir, infer_mesh_shape
@@ -113,6 +115,11 @@ flags.DEFINE_string(
     None,
     "The mesh selector string. See `SpmdTrainer.Config.mesh_rules` for details.",
 )
+flags.DEFINE_bool("elastic_enabled", False, "Enables Pathways pause-and-resume training.")
+flags.DEFINE_integer("elastic_min_slice_count", 1, "Minimum slice count (compatibility flag).")
+flags.DEFINE_string("elastic_backup_kind", "snapshot", "Elastic backup kind (compatibility flag).")
+flags.DEFINE_integer("elastic_snapshot_every_n_steps", 5, "Snapshot frequency in steps.")
+flags.DEFINE_integer("save_every_n_steps", None, "Checkpoint frequency in steps.")
 
 FLAGS = flags.FLAGS
 
@@ -170,6 +177,8 @@ def get_trainer_config(
         )
     if trainer_config.log_every_n_steps is None:
         trainer_config.log_every_n_steps = flag_values.trainer_log_every_n_steps
+    _configure_elastic_training(trainer_config, flag_values)
+    _configure_checkpoint_frequency(trainer_config, flag_values.save_every_n_steps)
     for eval_cfg in trainer_config.evalers.values():
         eval_cfg.trace_at_iters = [int(el) for el in flag_values.eval_trace_at_iters]
     if flag_values.device_monitor == "tpu":
@@ -187,6 +196,40 @@ def get_trainer_config(
         if not isinstance(trainer_config.checkpointer.trainer_dir, str):
             trainer_config.checkpointer.trainer_dir = trainer_config.dir
     return trainer_config
+
+
+def _configure_elastic_training(
+    trainer_config: SpmdTrainer.Config, flag_values: flags.FlagValues
+):
+    if not flag_values.elastic_enabled:
+        return
+    if getattr(trainer_config.checkpointer, "klass", None) is Checkpointer:
+        ckpt = trainer_config.checkpointer
+        trainer_config.checkpointer = OrbaxCheckpointer.default_config().set(
+            save_policy=ckpt.save_policy,
+            keep_last_n=ckpt.keep_last_n,
+            keep_period=ckpt.keep_every_n_steps,
+            max_concurrent_save_gb=16,
+        )
+    trainer_config.snapshotter = snapshot.Snapshotter.default_config()
+    trainer_config.snapshotter.save_policy.set(n=flag_values.elastic_snapshot_every_n_steps)
+
+
+def _configure_checkpoint_frequency(
+    trainer_config: SpmdTrainer.Config, save_every_n_steps: Optional[int]
+):
+    if save_every_n_steps is None:
+        return
+    step_interval = int(save_every_n_steps)
+    ckpt = trainer_config.checkpointer
+    for obj, attr in (
+        (ckpt.save_policy, "n"),
+        (ckpt.save_policy, "min_step"),
+        (ckpt, "keep_every_n_steps"),
+        (ckpt, "keep_period"),
+    ):
+        if hasattr(obj, attr):
+            setattr(obj, attr, step_interval)
 
 
 def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
