@@ -2,6 +2,7 @@
 
 """Elastic training utilities for the Pathways backend (no-ops on McJAX)."""
 
+import inspect
 import math
 from typing import Any, Callable, Optional
 
@@ -25,12 +26,39 @@ def ensure_elastic_manager_initialized(enabled: bool) -> Optional[manager.Manage
         if not pathwaysutils.is_pathways_backend_used():
             logging.warning("Elastic training requires the Pathways backend; running without it.")
         else:
-            elastic_manager = manager.Manager(wait_for_slices=True, poll_interval=5)
+            elastic_manager = _create_manager(poll_interval=5)
     return elastic_manager
 
 
+def _create_manager(*, poll_interval: float) -> manager.Manager:
+    """Creates a `Manager` that has waited for all slices.
+
+    Released pathwaysutils (pinned to 0.1.11; latest 0.1.13) has no
+    `Manager(wait_for_slices=..., poll_interval=...)`, so wait explicitly there.
+    """
+    if "wait_for_slices" in inspect.signature(manager.Manager).parameters:
+        return manager.Manager(wait_for_slices=True, poll_interval=poll_interval)
+    mgr = manager.Manager()
+    mgr.active_slice_indices = elastic.wait_for_slices(
+        slice_count=mgr.total_slice_count,
+        slice_to_devices=mgr.slice_to_devices,
+        poll_interval=poll_interval,
+    )
+    return mgr
+
+
 def live_devices() -> list[jax.Device]:
-    return jax.devices() if elastic_manager is None else elastic_manager.active_devices
+    if elastic_manager is None:
+        return jax.devices()
+    # `Manager.active_devices` is not in released pathwaysutils.
+    active = getattr(elastic_manager, "active_devices", None)
+    if active is not None:
+        return list(active)
+    return [
+        d
+        for i in sorted(elastic_manager.active_slice_indices)
+        for d in elastic_manager.slice_to_devices[i]
+    ]
 
 
 def total_slice_count() -> Optional[int]:
