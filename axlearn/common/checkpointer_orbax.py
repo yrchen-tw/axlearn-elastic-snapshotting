@@ -61,6 +61,30 @@ except ImportError:
 from orbax.checkpoint import pathways as orbax_pathways
 
 
+def patch_colocated_dispatcher_for_pinned_host():
+    """Lets the Pathways Colocated Python dispatcher save `pinned_host` arrays.
+
+    Snapshot-backed checkpoints (Policy A) pass `pinned_host` arrays to `Checkpointer.save()`.
+    The sidecar rebuilds their shards as `device` buffers, so keeping the `pinned_host` memory kind
+    fails with "Memory kind mismatch with xla::PjRtBuffers" and the save never commits. Idempotent.
+    """
+    # pylint: disable-next=import-outside-toplevel
+    from orbax.checkpoint._src.multihost import dispatchers
+
+    cls = dispatchers.ColocatedPythonDispatcher
+    orig = cls._colocated_cpu_sharding  # pylint: disable=protected-access
+    if getattr(orig, "_pinned_host_patched", False):
+        return
+
+    def _colocated_cpu_sharding(self, sharding):
+        if getattr(sharding, "memory_kind", None) == "pinned_host":
+            sharding = sharding.with_memory_kind("device")
+        return orig(self, sharding)
+
+    _colocated_cpu_sharding._pinned_host_patched = True
+    cls._colocated_cpu_sharding = _colocated_cpu_sharding  # pylint: disable=protected-access
+
+
 class _TfIteratorHandler(ocp.type_handlers.TypeHandler):
     """Serializes tf.data.Iterator.
 
@@ -455,6 +479,7 @@ class OrbaxCheckpointer(BaseCheckpointer):
                     else {}
                 ),
             )
+            patch_colocated_dispatcher_for_pinned_host()
         CheckpointManager = (  # pylint: disable=invalid-name
             _CheckpointManagerWithTrackerFile
             if cfg.read_latest_checkpoint_from_tracker_file
