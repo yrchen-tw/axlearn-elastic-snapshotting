@@ -3,6 +3,7 @@
 """In-memory host-pinned snapshot checkpointer and Pathways pause-resume helpers."""
 
 import contextlib
+import inspect
 import queue
 import threading
 from typing import Any, Callable, Optional, Union
@@ -12,7 +13,7 @@ import jax
 import numpy as np
 
 import pathwaysutils
-from pathwaysutils.elastic import manager
+from pathwaysutils.elastic import elastic, manager
 from pathwaysutils.experimental import split_by_mesh_axis
 
 from orbax.checkpoint import pathways as orbax_pathways
@@ -36,6 +37,23 @@ def _to_pinned_host(tree: Any):
         if isinstance(x, jax.Array) and hasattr(x, "sharding") else x, tree)
 
 
+def _create_manager(*, poll_interval: float) -> manager.Manager:
+    """Creates a `Manager` that has waited for all slices.
+
+    Released pathwaysutils (pinned to 0.1.11; latest 0.1.13) has no
+    `Manager(wait_for_slices=..., poll_interval=...)`, so wait explicitly there.
+    """
+    if "wait_for_slices" in inspect.signature(manager.Manager).parameters:
+        return manager.Manager(wait_for_slices=True, poll_interval=poll_interval)
+    mgr = manager.Manager()
+    mgr.active_slice_indices = elastic.wait_for_slices(
+        slice_count=mgr.total_slice_count,
+        slice_to_devices=mgr.slice_to_devices,
+        poll_interval=poll_interval,
+    )
+    return mgr
+
+
 class Snapshotter(BaseCheckpointer):
     """Manages asynchronous backups of JAX array states to pinned host memory."""
 
@@ -56,7 +74,7 @@ class Snapshotter(BaseCheckpointer):
         self._generation = 0
         self._manager = None
         if pathwaysutils.is_pathways_backend_used():
-            self._manager = manager.Manager(wait_for_slices=True, poll_interval=5)
+            self._manager = _create_manager(poll_interval=5)
             with contextlib.suppress(Exception):
                 orbax_pathways.register_type_handlers(
                     use_single_replica_array_handler=False,
