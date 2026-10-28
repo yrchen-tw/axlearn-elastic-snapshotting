@@ -25,6 +25,9 @@ from axlearn.common.config import ConfigOr, config_class, config_for_function, m
 from axlearn.common.module import Module
 from axlearn.common.utils import Nested, Tensor, TensorSpec
 
+# Restore errors after which the snapshot is unusable, so the trainer falls back to a checkpoint.
+_UNUSABLE_SNAPSHOT_ERRORS = ("Full data loss while cloning", "has been donated or deleted")
+
 
 def _free_arrays(tree: Any):
     for x in jax.tree.leaves(tree):
@@ -45,6 +48,7 @@ def _create_manager(*, poll_interval: float) -> manager.Manager:
     Released pathwaysutils (pinned to 0.1.11; latest 0.1.13) has no
     `Manager(wait_for_slices=..., poll_interval=...)`, so wait explicitly there.
     """
+    elastic_utils.install_elastic_event_cleanup()
     if "wait_for_slices" in inspect.signature(manager.Manager).parameters:
         return manager.Manager(wait_for_slices=True, poll_interval=poll_interval)
     mgr = manager.Manager()
@@ -196,7 +200,9 @@ class Snapshotter(BaseCheckpointer):
             restored = jax.tree.map(self._restore_leaf, pinned_state, state)
             jax.block_until_ready(restored)
         except (ValueError, jax.errors.JaxRuntimeError) as e:
-            if isinstance(e, jax.errors.JaxRuntimeError) and "Full data loss while cloning" not in str(e):
+            if isinstance(e, jax.errors.JaxRuntimeError) and not any(
+                msg in str(e) for msg in _UNUSABLE_SNAPSHOT_ERRORS
+            ):
                 raise
             logging.warning("[ELASTIC] Snapshot at step %d has no healthy shards: %s", snap_step, e)
             self.evict()
