@@ -31,6 +31,7 @@ from jax.sharding import PartitionSpec
 
 from axlearn.common import (
     debug_utils,
+    elastic_utils,
     flax_struct_test,
     layers,
     learner,
@@ -1318,6 +1319,81 @@ class TrainerTest(test_utils.TestCase):
         )
         trainer: SpmdTrainer = cfg.instantiate(parent=None)
         self.assertEqual(partition_spec, trainer.input.partition_spec)
+
+
+class ElasticGoodputEventsTest(test_utils.TestCase):
+    """Tests the goodput events recorded on elastic events."""
+
+    def _elastic_wait_calls(self, trainer: unittest.mock.MagicMock) -> list[tuple[Any, ...]]:
+        return [
+            c.args
+            for c in trainer._maybe_record_event.call_args_list
+            if c.args[0]
+            in (measurement.Event.START_ELASTIC_WAIT, measurement.Event.END_ELASTIC_WAIT)
+        ]
+
+    def _restorable_trainer(self) -> unittest.mock.MagicMock:
+        """Returns a mock trainer whose restore falls back to the checkpoint."""
+        trainer = unittest.mock.MagicMock()
+        trainer._trainer_state = None
+        trainer._elastic_wait_event_type = None
+        trainer.snapshotter.latest_snapshot_step = 3
+        trainer._latest_checkpoint_step.return_value = 0
+        trainer.snapshotter.restore.return_value = (None, None)
+        trainer.restore_checkpoint.return_value = 3
+        return trainer
+
+    def test_elastic_wait_event_type(self):
+        trainer = self._restorable_trainer()
+        SpmdTrainer._on_elastic_event(trainer)
+        self.assertIsNone(trainer._trainer_state)
+        trainer._record_slice_counts.assert_called_once_with(stepping=False)
+
+        # The end of the wait has the type of its start.
+        SpmdTrainer._restore_after_elastic_event(trainer)
+        self.assertEqual(
+            [
+                (measurement.Event.START_ELASTIC_WAIT, "elastic_slice_down"),
+                (measurement.Event.END_ELASTIC_WAIT, "elastic_slice_down"),
+            ],
+            self._elastic_wait_calls(trainer),
+        )
+        self.assertIsNone(trainer._elastic_wait_event_type)
+
+    def test_reinit_without_elastic_wait(self):
+        """Tests that no unpaired end of an elastic wait is recorded."""
+        trainer = self._restorable_trainer()
+        SpmdTrainer._restore_after_elastic_event(trainer)
+        self.assertEqual([], self._elastic_wait_calls(trainer))
+        trainer._maybe_record_event.assert_any_call(measurement.Event.START_ELASTIC_REINIT)
+        trainer._maybe_record_event.assert_any_call(measurement.Event.END_ELASTIC_REINIT)
+        # Slice counts at the start and end of the reinit.
+        self.assertEqual(2, trainer._record_slice_counts.call_count)
+
+    @parameterized.parameters(
+        dict(stepping=True, available=3, expected=(2, 2)),
+        dict(stepping=False, available=3, expected=(0, 3)),
+        # If the available slices cannot be checked, the active slices are reported.
+        dict(stepping=False, available=None, expected=(0, 2)),
+    )
+    def test_record_slice_counts(
+        self, stepping: bool, available: Optional[int], expected: tuple[int, int]
+    ):
+        trainer = unittest.mock.MagicMock()
+        manager = unittest.mock.MagicMock(active_slice_count=2, total_slice_count=4)
+        with (
+            unittest.mock.patch.object(elastic_utils, "elastic_manager", manager),
+            unittest.mock.patch.object(
+                elastic_utils, "available_slice_count", return_value=available
+            ),
+        ):
+            SpmdTrainer._record_slice_counts(trainer, stepping=stepping)
+        trainer._maybe_record_event.assert_called_once_with(
+            measurement.Event.RECORD_SLICE_COUNTS,
+            active_slices=expected[0],
+            total_slices=4,
+            available_slices=expected[1],
+        )
 
 
 class SelectMeshConfigTest(test_utils.TestCase):

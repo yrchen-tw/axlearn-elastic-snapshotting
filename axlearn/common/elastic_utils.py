@@ -4,7 +4,8 @@
 
 from typing import Optional
 
-from pathwaysutils.elastic import manager
+from absl import logging
+from pathwaysutils.elastic import elastic, manager
 
 # The elastic manager of the `Snapshotter`, set when it is created on Pathways.
 elastic_manager: Optional[manager.Manager] = None
@@ -16,3 +17,16 @@ def elastic_enabled() -> bool:
 
 def total_slice_count() -> Optional[int]:
     return None if elastic_manager is None else elastic_manager.total_slice_count
+
+
+def available_slice_count() -> Optional[int]:
+    """Returns the number of healthy slices, or None when not elastic or if the check fails."""
+    if elastic_manager is None:
+        return None
+    try:
+        return len(
+            elastic.get_active_slice_indices(slice_to_devices=elastic_manager.slice_to_devices)
+        )
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logging.warning("Failed to check the available slices: %s", e)
+        return None

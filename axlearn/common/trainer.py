@@ -21,7 +21,7 @@ from jax.experimental import multihost_utils
 from jax.experimental.pjit import pjit
 
 from axlearn.common import file_system as fs
-from axlearn.common import measurement, utils
+from axlearn.common import elastic_utils, measurement, utils
 from axlearn.common.base_layer import ParameterSpec
 from axlearn.common.base_model import BaseModel
 from axlearn.common.checkpointer import BaseCheckpointer, Checkpointer
@@ -269,6 +269,8 @@ class SpmdTrainer(Module):
         self._device_monitor = maybe_instantiate(cfg.device_monitor)
         self._recorder = maybe_instantiate(cfg.recorder)
         self._is_initialized: bool = False
+        # The event type of the pending elastic wait, if any.
+        self._elastic_wait_event_type: Optional[str] = None
         self._maybe_record_event(measurement.Event.START_ACCELERATOR_INIT)
 
         if cfg.model.dtype is None:
@@ -344,6 +346,8 @@ class SpmdTrainer(Module):
             self._add_child("learner", cfg.learner)
             if cfg.snapshotter is not None:
                 self._add_child("snapshotter", cfg.snapshotter)
+                # The snapshotter creates the elastic manager once the slices are active.
+                self._record_slice_counts()
             cfg.checkpointer.dir = cfg.checkpointer.dir or os.path.join(cfg.dir, "checkpoints")
             self._add_child("checkpointer", cfg.checkpointer)
             if cfg.init_state_builder is not None:
@@ -573,8 +577,30 @@ class SpmdTrainer(Module):
             else contextlib.nullcontext()
         )
 
+    def _record_slice_counts(self, *, stepping: bool = True):
+        """Records the slice counts. No slice is stepping during an elastic event."""
+        if (mgr := elastic_utils.elastic_manager) is None:
+            return
+        active_slices = mgr.active_slice_count if stepping else 0
+        available_slices = None if stepping else elastic_utils.available_slice_count()
+        self._maybe_record_event(
+            measurement.Event.RECORD_SLICE_COUNTS,
+            active_slices=active_slices,
+            total_slices=mgr.total_slice_count,
+            available_slices=(
+                mgr.active_slice_count if available_slices is None else available_slices
+            ),
+        )
+
     def _on_elastic_event(self):
         self._trainer_state = None
+        # Goodput classifies the wait by its type, and pairs its start and end by type.
+        # Pause-and-resume only waits for the lost slices to come back.
+        self._elastic_wait_event_type = "elastic_slice_down"
+        self._maybe_record_event(
+            measurement.Event.START_ELASTIC_WAIT, self._elastic_wait_event_type
+        )
+        self._record_slice_counts(stepping=False)
 
     def _maybe_elastic_retry(self, fn: Callable[[], Any]) -> Callable[[], Any]:
         """Wraps `fn` with elastic retry recovery if a snapshotter is configured."""
@@ -995,6 +1021,13 @@ class SpmdTrainer(Module):
     def _restore_after_elastic_event(self):
         if self._trainer_state is not None:
             return
+        if self._elastic_wait_event_type is not None:
+            self._maybe_record_event(
+                measurement.Event.END_ELASTIC_WAIT, self._elastic_wait_event_type
+            )
+            self._elastic_wait_event_type = None
+        self._maybe_record_event(measurement.Event.START_ELASTIC_REINIT)
+        self._record_slice_counts()
         self._step_log(
             "[ELASTIC][SCALE] devices=%s unchanged; reusing mesh.", len(self._mesh.devices.flat)
         )
@@ -1013,6 +1046,8 @@ class SpmdTrainer(Module):
                 self.init(jnp.asarray(self._prng_key))
                 self._step = 0
             self.save_snapshot(force=True)
+        self._maybe_record_event(measurement.Event.END_ELASTIC_REINIT)
+        self._record_slice_counts()
 
     def restore_checkpoint(self, restore_step: Optional[int] = None) -> Optional[int]:
         """Restores trainer state from checkpoint.
