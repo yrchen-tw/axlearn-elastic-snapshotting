@@ -363,6 +363,33 @@ class ElasticUtilsTest(absltest.TestCase):
                 steps = trainer._reconfigure_elastic_mesh(devs[:half])  # pylint: disable=protected-access
             self.assertEqual(steps, expected_steps, msg=f"scale={scale}")
 
+    def test_elastic_event_cleanup_keeps_host_arrays(self):
+        """The slice-down cleanup must not delete the pinned-host snapshot."""
+
+        def _array(memory_kind, platform="tpu"):
+            arr = mock.MagicMock()
+            arr.sharding.memory_kind = memory_kind
+            arr.sharding.device_set = {mock.MagicMock(platform=platform)}
+            return arr
+
+        device = _array("device")
+        pinned = _array("pinned_host")
+        unpinned = _array("unpinned_host")
+        cpu = _array(None, platform="cpu")
+        with mock.patch.object(elastic_utils, "manager") as mock_manager:
+            elastic_utils.install_elastic_event_cleanup()
+            # pylint: disable-next=protected-access
+            cleanup = mock_manager._elastic_event_cleanup
+        self.assertIs(cleanup, elastic_utils._elastic_event_cleanup)  # pylint: disable=protected-access
+        with mock.patch.object(
+            elastic_utils.jax, "live_arrays", return_value=[device, pinned, unpinned, cpu]
+        ), mock.patch.object(elastic_utils.jax, "clear_caches") as clear_caches:
+            cleanup()
+        clear_caches.assert_called_once()
+        device.delete.assert_called_once()
+        for arr in (pinned, unpinned, cpu):
+            arr.delete.assert_not_called()
+
 
 if __name__ == "__main__":
     absltest.main()

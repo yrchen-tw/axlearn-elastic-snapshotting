@@ -21,6 +21,9 @@ from axlearn.common.utils import Nested, Tensor, TensorSpec
 
 _HBM_GIB = {"v5e": 15.5, "v5 lite": 15.5, "v6e": 31.5, "v6 lite": 31.5, "v4": 31.5, "v5": 94.5, "7x": 190.0}
 
+# Restore errors after which the snapshot is unusable, so the trainer falls back to a checkpoint.
+_UNUSABLE_SNAPSHOT_ERRORS = ("Full data loss while cloning", "has been donated or deleted")
+
 
 def _free_arrays(tree: Any, memory_kind: str = "pinned_host"):
     for x in jax.tree_util.tree_leaves(tree):
@@ -266,7 +269,9 @@ class Snapshotter(BaseCheckpointer):
             restored = jax.tree.map(_restore_leaf, pinned_state, state)
             jax.block_until_ready(restored)
         except (ValueError, jax.errors.JaxRuntimeError) as e:
-            if isinstance(e, jax.errors.JaxRuntimeError) and "Full data loss while cloning" not in str(e):
+            if isinstance(e, jax.errors.JaxRuntimeError) and not any(
+                msg in str(e) for msg in _UNUSABLE_SNAPSHOT_ERRORS
+            ):
                 raise
             logging.warning("[ELASTIC] Snapshot at step %d has no healthy shards: %s", snap_step, e)
             self.evict()

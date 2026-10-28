@@ -2,6 +2,7 @@
 
 """Elastic training utilities for the Pathways backend (no-ops on McJAX)."""
 
+import contextlib
 import inspect
 import math
 from typing import Any, Callable, Optional
@@ -14,6 +15,38 @@ from pathwaysutils.elastic import elastic, manager
 ScaleUpSignalError = manager.ScaleUpSignalError
 
 elastic_manager: Optional[manager.Manager] = None
+
+
+def _is_host_array(array: jax.Array) -> bool:
+    sharding = getattr(array, "sharding", None)
+    if getattr(sharding, "memory_kind", None) in ("pinned_host", "unpinned_host"):
+        return True
+    return any(getattr(d, "platform", None) == "cpu" for d in getattr(sharding, "device_set", ()))
+
+
+def _elastic_event_cleanup() -> None:
+    """Replaces `manager._elastic_event_cleanup`, keeping host-resident arrays alive.
+
+    The released cleanup (pathwaysutils 0.1.11) deletes *every* live array after a slice-down,
+    including the `Snapshotter`'s pinned-host snapshot, so the snapshot restore that follows fails
+    with "Input array #0 has been donated or deleted". Device arrays are still deleted and JAX
+    caches are still cleared, as upstream does.
+    """
+    try:
+        jax.profiler.stop_trace()
+    except (RuntimeError, ValueError):
+        pass
+    jax.clear_caches()
+    for array in jax.live_arrays():
+        if _is_host_array(array):
+            continue
+        with contextlib.suppress(Exception):
+            array.delete()
+
+
+def install_elastic_event_cleanup():
+    """Makes `manager.Manager.elastic_retry` keep host-resident snapshots. Idempotent."""
+    manager._elastic_event_cleanup = _elastic_event_cleanup  # pylint: disable=protected-access
 
 
 def elastic_enabled() -> bool:
@@ -36,6 +69,7 @@ def _create_manager(*, poll_interval: float) -> manager.Manager:
     Released pathwaysutils (pinned to 0.1.11; latest 0.1.13) has no
     `Manager(wait_for_slices=..., poll_interval=...)`, so wait explicitly there.
     """
+    install_elastic_event_cleanup()
     if "wait_for_slices" in inspect.signature(manager.Manager).parameters:
         return manager.Manager(wait_for_slices=True, poll_interval=poll_interval)
     mgr = manager.Manager()
