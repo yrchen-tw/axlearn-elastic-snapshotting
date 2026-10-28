@@ -19,6 +19,7 @@ from pathwaysutils.experimental import split_by_mesh_axis
 from orbax.checkpoint import pathways as orbax_pathways
 
 from axlearn.common.checkpointer import BaseCheckpointer, every_n_steps_policy
+from axlearn.common.checkpointer_orbax import patch_colocated_dispatcher_for_pinned_host
 from axlearn.common.config import ConfigOr, config_class, config_for_function, maybe_instantiate
 from axlearn.common.module import Module
 from axlearn.common.utils import Nested, Tensor, TensorSpec
@@ -83,6 +84,7 @@ class Snapshotter(BaseCheckpointer):
                     array_metadata_store=None,
                     enable_write_sharding_file=False,
                 )
+            patch_colocated_dispatcher_for_pinned_host()
         threading.Thread(target=self._worker, name=f"{self.path()}_worker", daemon=True).start()
 
     def elastic_retry(self, **kwargs) -> Callable[[Callable], Callable]:
