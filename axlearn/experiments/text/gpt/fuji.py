@@ -40,6 +40,7 @@ from axlearn.common.flash_attention.layer import FlashBlockSizeModifier
 from axlearn.common.flash_attention.remat import save_or_offload_flash_attention_policy
 from axlearn.common.layers import RMSNorm
 from axlearn.common.trainer import SpmdTrainer
+from axlearn.common.checkpointer_orbax import OrbaxCheckpointer
 from axlearn.common.trainer_config_modifier import (
     ChainConfigModifier,
     FP8ConfigModifier,
@@ -728,6 +729,14 @@ def get_trainer_kwargs(
                                     k: {"param_partition_spec": ("model", ("expert", "fsdp", "seq"))}
                                     for k in ("model.decoder.emb.token_emb", "model.decoder.lm_head")
                                 },
+                            ),
+                            # Run-only: checkpoint with Orbax (Colocated Python), as before 98071634
+                            # dropped the conversion from launch_trainer.
+                            ModuleConfigModifier.default_config().set(
+                                target_config="checkpointer",
+                                modification=OrbaxCheckpointer.default_config().set(
+                                    max_concurrent_save_gb=16
+                                ),
                             ),
                         ],
                     ),
