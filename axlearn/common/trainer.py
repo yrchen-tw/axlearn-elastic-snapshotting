@@ -3,13 +3,14 @@
 """Defines SpmdTrainer, a trainer that supports partitioning of computation and data with GSPMD."""
 
 import contextlib
+import datetime
 import itertools
 import math
 import os.path
 import signal
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from typing import Any, Callable, ContextManager, Literal, NamedTuple, Optional, Union
 
 import jax
@@ -20,7 +21,7 @@ from jax.experimental import multihost_utils
 from jax.experimental.pjit import pjit
 
 from axlearn.common import file_system as fs
-from axlearn.common import measurement, utils
+from axlearn.common import elastic_utils, measurement, utils
 from axlearn.common.base_layer import ParameterSpec
 from axlearn.common.base_model import BaseModel
 from axlearn.common.checkpointer import BaseCheckpointer, Checkpointer
@@ -68,6 +69,10 @@ from axlearn.common.utils import (
     match_regex_rules,
     thread_stack_traces,
 )
+
+# Custom badput event types for the intervals that ml-goodput-measurement has no event for.
+SNAPSHOT_RESTORE_BADPUT_EVENT_TYPE = "SNAPSHOT_RESTORE"
+DATA_ITERATOR_INIT_BADPUT_EVENT_TYPE = "DATA_ITERATOR_INIT"
 
 
 class TrainerState(NamedTuple):
@@ -268,6 +273,8 @@ class SpmdTrainer(Module):
         self._device_monitor = maybe_instantiate(cfg.device_monitor)
         self._recorder = maybe_instantiate(cfg.recorder)
         self._is_initialized: bool = False
+        # The event type of the pending elastic wait, if any.
+        self._elastic_wait_event_type: Optional[str] = None
         self._maybe_record_event(measurement.Event.START_ACCELERATOR_INIT)
 
         if cfg.model.dtype is None:
@@ -334,7 +341,7 @@ class SpmdTrainer(Module):
                 "input", maybe_set_config(cfg.input, is_training=True)
             )
             # Start from the beginning of the input dataset by default.
-            self._input_iter = iter(self.input.dataset())
+            self._input_iter = self._create_input_iterator()
             cfg.summary_writer.dir = cfg.summary_writer.dir or os.path.join(
                 cfg.dir, "summaries", "train_train"
             )
@@ -343,6 +350,8 @@ class SpmdTrainer(Module):
             self._add_child("learner", cfg.learner)
             if cfg.snapshotter is not None:
                 self._add_child("snapshotter", cfg.snapshotter)
+                # The snapshotter creates the elastic manager once the slices are active.
+                self._record_slice_counts()
             cfg.checkpointer.dir = cfg.checkpointer.dir or os.path.join(cfg.dir, "checkpoints")
             self._add_child("checkpointer", cfg.checkpointer)
             if cfg.init_state_builder is not None:
@@ -572,8 +581,30 @@ class SpmdTrainer(Module):
             else contextlib.nullcontext()
         )
 
+    def _record_slice_counts(self, *, stepping: bool = True):
+        """Records the slice counts. No slice is stepping during an elastic event."""
+        if (mgr := elastic_utils.elastic_manager) is None:
+            return
+        active_slices = mgr.active_slice_count if stepping else 0
+        available_slices = None if stepping else elastic_utils.available_slice_count()
+        self._maybe_record_event(
+            measurement.Event.RECORD_SLICE_COUNTS,
+            active_slices=active_slices,
+            total_slices=mgr.total_slice_count,
+            available_slices=(
+                mgr.active_slice_count if available_slices is None else available_slices
+            ),
+        )
+
     def _on_elastic_event(self):
         self._trainer_state = None
+        # Goodput classifies the wait by its type, and pairs its start and end by type.
+        # Pause-and-resume only waits for the lost slices to come back.
+        self._elastic_wait_event_type = "elastic_slice_down"
+        self._maybe_record_event(
+            measurement.Event.START_ELASTIC_WAIT, self._elastic_wait_event_type
+        )
+        self._record_slice_counts(stepping=False)
 
     def _maybe_elastic_retry(self, fn: Callable[[], Any]) -> Callable[[], Any]:
         """Wraps `fn` with elastic retry recovery if a snapshotter is configured."""
@@ -964,6 +995,7 @@ class SpmdTrainer(Module):
 
         if self.step >= cfg.max_step:
             self._step_log("Already reached max_step=%s. Stopping", cfg.max_step)
+            self._maybe_record_event(measurement.Event.END_TRAINING_PREPARATION)
             return False
 
         self.save_snapshot(force=True)
@@ -972,19 +1004,79 @@ class SpmdTrainer(Module):
         return True
 
     def _on_restore(self):
+        """Called by the Snapshotter's elastic retry before each attempt, once all slices are back.
+
+        Restores the trainer state from the latest snapshot (or the checkpoint) on the unchanged mesh.
+
+        Within the elastic reinitialization, the (mesh) setup is recorded as accelerator
+        initialization and the restore as training preparation, as MaxText does when it reruns its
+        setup on an elastic event. Goodput tools such as the goodput timeline break the recovery
+        down by these events; ml-goodput-measurement discounts their overlap with the elastic
+        reinitialization, so they are not counted twice.
+        """
         if self._trainer_state is not None:
             return
+        if self._elastic_wait_event_type is not None:
+            self._maybe_record_event(
+                measurement.Event.END_ELASTIC_WAIT, self._elastic_wait_event_type
+            )
+            self._elastic_wait_event_type = None
+        self._maybe_record_event(measurement.Event.START_ELASTIC_REINIT)
+        self._record_slice_counts()
+        self._maybe_record_event(measurement.Event.START_ACCELERATOR_INIT)
         self._step_log(
             "[ELASTIC][SCALE] devices=%s unchanged; reusing mesh.", len(self._mesh.devices.flat)
         )
+        self._maybe_record_event(measurement.Event.END_ACCELERATOR_INIT)
+        self._maybe_record_event(measurement.Event.START_TRAINING_PREPARATION)
         self.checkpointer.cancel()
         with self.mesh():
-            step, state = self.snapshotter.restore(state=self._trainer_state_specs._asdict())
+            step, state = self._restore_snapshot()
             if step is not None:
                 self._step, self._trainer_state = step, TrainerState(**state)
             elif self.restore_checkpoint() is None:
                 raise RuntimeError("Failed to restore from both snapshot and checkpoint.")
+            self._maybe_record_event(measurement.Event.END_TRAINING_PREPARATION)
+            # Like MaxText, which saves the first snapshot after a recovery outside of its setup
+            # events, the snapshot is saved after the training preparation.
             self.save_snapshot(force=True)
+        self._maybe_record_event(measurement.Event.END_ELASTIC_REINIT)
+        self._record_slice_counts()
+
+    def _restore_snapshot(self) -> tuple[Optional[int], Optional[Nested[Tensor]]]:
+        """Restores the latest in-memory snapshot.
+
+        Returns:
+            The restored (step, state), or (None, None) if no usable snapshot is found.
+        """
+        # Orbax logs checkpoint restores, but nothing logs snapshot restores. Recorded as a custom
+        # badput event, as ml-goodput-measurement has no snapshot restore event. If the restore
+        # raises, the start stays unpaired and is ignored.
+        self._maybe_record_event(
+            measurement.Event.START_CUSTOM_BADPUT_EVENT,
+            custom_badput_event_type=SNAPSHOT_RESTORE_BADPUT_EVENT_TYPE,
+        )
+        step, state = self.snapshotter.restore(state=self._trainer_state_specs._asdict())
+        self._maybe_record_event(
+            measurement.Event.END_CUSTOM_BADPUT_EVENT,
+            custom_badput_event_type=SNAPSHOT_RESTORE_BADPUT_EVENT_TYPE,
+        )
+        return step, state
+
+    def _create_input_iterator(self) -> Iterator:
+        """Returns a new iterator of the training input."""
+        # Recorded as a custom badput event, as ml-goodput-measurement has no data iterator event,
+        # on every call: at init and whenever a checkpoint restore rebuilds the iterator.
+        self._maybe_record_event(
+            measurement.Event.START_CUSTOM_BADPUT_EVENT,
+            custom_badput_event_type=DATA_ITERATOR_INIT_BADPUT_EVENT_TYPE,
+        )
+        input_iter = iter(self.input.dataset())
+        self._maybe_record_event(
+            measurement.Event.END_CUSTOM_BADPUT_EVENT,
+            custom_badput_event_type=DATA_ITERATOR_INIT_BADPUT_EVENT_TYPE,
+        )
+        return input_iter
 
     def restore_checkpoint(self, restore_step: Optional[int] = None) -> Optional[int]:
         """Restores trainer state from checkpoint.
@@ -1006,16 +1098,15 @@ class SpmdTrainer(Module):
             for path, spec in utils.flatten_items(self._trainer_state_specs):
                 self.vlog(1, "restore spec: %s=%s", path, spec)
             ckpt_state_spec = self._trainer_state_specs._asdict()
-            ckpt_state_spec_with_input_iter = dict(
-                **ckpt_state_spec, input_iter=iter(self.input.dataset())
-            )
             restore_input_iter = cfg.save_input_iterator
             try:
                 # Try to restore with `input_iter`.
                 step, ckpt_state = self.checkpointer.restore(
                     step=restore_step,
                     state=(
-                        ckpt_state_spec_with_input_iter if restore_input_iter else ckpt_state_spec
+                        dict(**ckpt_state_spec, input_iter=self._create_input_iterator())
+                        if restore_input_iter
+                        else ckpt_state_spec
                     ),
                 )
                 if step is not None:
@@ -1040,7 +1131,9 @@ class SpmdTrainer(Module):
                 step, ckpt_state = self.checkpointer.restore(
                     step=restore_step,
                     state=(
-                        ckpt_state_spec_with_input_iter if restore_input_iter else ckpt_state_spec
+                        dict(**ckpt_state_spec, input_iter=self._create_input_iterator())
+                        if restore_input_iter
+                        else ckpt_state_spec
                     ),
                 )
                 if step is not None:
@@ -1241,9 +1334,7 @@ class SpmdTrainer(Module):
         force_runs: Optional[set[str]] = None,
     ) -> dict[str, Any]:
         """Runs evaluations and returns the corresponding summaries."""
-        self._maybe_record_event(
-            measurement.Event.START_CUSTOM_BADPUT_EVENT, custom_badput_event_type="EVAL"
-        )
+        eval_start_time = datetime.datetime.now(datetime.timezone.utc)
         evaler_summaries = {}
         # Note: we will use the same eval key as the training keys of the future step,
         # which should be okay.
@@ -1257,9 +1348,16 @@ class SpmdTrainer(Module):
                 force_run=bool(force_runs is not None and evaler_name in force_runs),
             )
             evaler_summaries[evaler_name] = summaries
-        self._maybe_record_event(
-            measurement.Event.END_CUSTOM_BADPUT_EVENT, custom_badput_event_type="EVAL"
-        )
+        # Only record EVAL if an evaler ran. Evalers return None summaries if they did not.
+        if any(summaries is not None for summaries in evaler_summaries.values()):
+            self._maybe_record_event(
+                measurement.Event.START_CUSTOM_BADPUT_EVENT,
+                custom_badput_event_type="EVAL",
+                start_time=eval_start_time,
+            )
+            self._maybe_record_event(
+                measurement.Event.END_CUSTOM_BADPUT_EVENT, custom_badput_event_type="EVAL"
+            )
         return evaler_summaries
 
     def _pjit_train_step(self) -> jax.stages.Wrapped:

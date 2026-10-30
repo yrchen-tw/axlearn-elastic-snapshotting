@@ -2,8 +2,10 @@
 
 """Tests SpmdTrainer."""
 
+import contextlib
 import copy
 import dataclasses
+import datetime
 import math
 
 # pylint: disable=no-self-use
@@ -30,9 +32,11 @@ from jax.sharding import PartitionSpec
 
 from axlearn.common import (
     debug_utils,
+    elastic_utils,
     flax_struct_test,
     layers,
     learner,
+    measurement,
     optimizers,
     param_init,
     test_utils,
@@ -704,6 +708,107 @@ class TrainerTest(test_utils.TestCase):
                 == {k for k, v in output["evaler_summaries"].items() if v is not None}
             )
 
+    def test_eval_goodput_events(self):
+        """Tests that EVAL is recorded only at the steps where an evaler runs."""
+        cfg = SpmdTrainer.default_config().set(name="test_eval_goodput_events_trainer")
+        cfg.dir = tempfile.mkdtemp()
+        cfg.mesh_axis_names = ("data", "model")
+        cfg.mesh_shape = (1, 1)
+        cfg.model = DummyModel.default_config().set(dtype=jnp.float32)
+        cfg.input = DummyInput.default_config()
+        cfg.learner = learner.Learner.default_config().set(
+            optimizer=config_for_function(optimizers.sgd_optimizer).set(
+                learning_rate=0.1, decouple_weight_decay=True
+            )
+        )
+        cfg.evalers = dict(
+            eval_dummy=SpmdEvaler.default_config().set(
+                input=DummyInput.default_config().set(total_num_batches=2),
+                eval_policy=config_for_function(eval_every_n_steps_policy).set(n=2),
+            )
+        )
+        cfg.max_step = 5
+        cfg.watchdog_timeout_seconds = 0.1
+        recorder = unittest.mock.MagicMock()
+        cfg.recorder = config_for_function(lambda: recorder)
+        trainer: SpmdTrainer = cfg.instantiate(parent=None)
+        trainer.run(prng_key=jax.random.PRNGKey(123))
+
+        eval_calls = [
+            c
+            for c in recorder.record.call_args_list
+            if c.kwargs.get("custom_badput_event_type") == "EVAL"
+        ]
+        # The evaler runs at steps 2 and 4 only.
+        self.assertEqual(
+            [c.args[0] for c in eval_calls],
+            [
+                measurement.Event.START_CUSTOM_BADPUT_EVENT,
+                measurement.Event.END_CUSTOM_BADPUT_EVENT,
+            ]
+            * 2,
+        )
+        for start in eval_calls[::2]:
+            self.assertIsInstance(start.kwargs["start_time"], datetime.datetime)
+        events = [c.args[0] for c in recorder.record.call_args_list]
+        self.assertEqual(1, events.count(measurement.Event.END_TRAINING_PREPARATION))
+
+        # A trainer restored at max_step stops during preparation, which must still end.
+        recorder.reset_mock()
+        trainer: SpmdTrainer = cfg.instantiate(parent=None)
+        self.assertIsNone(trainer.run(prng_key=jax.random.PRNGKey(123)))
+        events = [c.args[0] for c in recorder.record.call_args_list]
+        self.assertNotIn(measurement.Event.START_STEP, events)
+        self.assertEqual(
+            [
+                measurement.Event.START_TRAINING_PREPARATION,
+                measurement.Event.END_TRAINING_PREPARATION,
+            ],
+            [e for e in events if "TRAINING_PREPARATION" in e.value],
+        )
+
+    @parameterized.parameters(dict(save_input_iterator=False), dict(save_input_iterator=True))
+    def test_data_iterator_init_goodput_events(self, save_input_iterator: bool):
+        """Tests that the creation of the input iterators is recorded."""
+        cfg = SpmdTrainer.default_config().set(name="test_data_iterator_init_trainer")
+        cfg.save_input_iterator = save_input_iterator
+        cfg.dir = tempfile.mkdtemp()
+        cfg.mesh_axis_names = ("data", "model")
+        cfg.mesh_shape = (1, 1)
+        cfg.model = DummyModel.default_config().set(dtype=jnp.float32)
+        cfg.input = DummyInput.default_config()
+        cfg.learner = learner.Learner.default_config().set(
+            optimizer=config_for_function(optimizers.sgd_optimizer).set(
+                learning_rate=0.1, decouple_weight_decay=True
+            )
+        )
+        cfg.max_step = 2
+        recorder = unittest.mock.MagicMock()
+        cfg.recorder = config_for_function(lambda: recorder)
+        trainer: SpmdTrainer = cfg.instantiate(parent=None)
+        trainer.run(prng_key=jax.random.PRNGKey(123))
+
+        events = [
+            (c.args[0], c.kwargs.get("custom_badput_event_type"))
+            for c in recorder.record.call_args_list
+        ]
+        data_iter_init = [i for i, e in enumerate(events) if e[1] == "DATA_ITERATOR_INIT"]
+        # At init, then, if the input iterator is restored, at restore (during the training
+        # preparation), before the first step.
+        self.assertEqual(
+            [
+                measurement.Event.START_CUSTOM_BADPUT_EVENT,
+                measurement.Event.END_CUSTOM_BADPUT_EVENT,
+            ]
+            * (2 if save_input_iterator else 1),
+            [events[i][0] for i in data_iter_init],
+        )
+        prep_start = events.index((measurement.Event.START_TRAINING_PREPARATION, None))
+        self.assertLess(data_iter_init[1], prep_start)
+        if save_input_iterator:
+            self.assertLess(prep_start, data_iter_init[2])
+        self.assertLess(data_iter_init[-1], events.index((measurement.Event.START_STEP, None)))
+
     def test_stop_on_exception(self):
         """Test that trainer exits cleanly if there's an exception in the main loop."""
         if not test_utils.is_supported_platform("cpu"):
@@ -1257,6 +1362,165 @@ class TrainerTest(test_utils.TestCase):
         )
         trainer: SpmdTrainer = cfg.instantiate(parent=None)
         self.assertEqual(partition_spec, trainer.input.partition_spec)
+
+
+class ElasticGoodputEventsTest(test_utils.TestCase):
+    """Tests the goodput events recorded on elastic events."""
+
+    def _elastic_wait_calls(self, trainer: unittest.mock.MagicMock) -> list[tuple[Any, ...]]:
+        return [
+            c.args
+            for c in trainer._maybe_record_event.call_args_list
+            if c.args[0]
+            in (measurement.Event.START_ELASTIC_WAIT, measurement.Event.END_ELASTIC_WAIT)
+        ]
+
+    def _restorable_trainer(self) -> unittest.mock.MagicMock:
+        """Returns a mock trainer whose restore falls back to the checkpoint."""
+        trainer = unittest.mock.MagicMock()
+        trainer._trainer_state = None
+        trainer._elastic_wait_event_type = None
+        trainer._restore_snapshot.return_value = (None, None)
+        trainer.restore_checkpoint.return_value = 3
+        return trainer
+
+    def test_elastic_wait_event_type(self):
+        trainer = self._restorable_trainer()
+        SpmdTrainer._on_elastic_event(trainer)
+        self.assertIsNone(trainer._trainer_state)
+        trainer._record_slice_counts.assert_called_once_with(stepping=False)
+
+        # The end of the wait has the type of its start.
+        SpmdTrainer._on_restore(trainer)
+        self.assertEqual(
+            [
+                (measurement.Event.START_ELASTIC_WAIT, "elastic_slice_down"),
+                (measurement.Event.END_ELASTIC_WAIT, "elastic_slice_down"),
+            ],
+            self._elastic_wait_calls(trainer),
+        )
+        self.assertIsNone(trainer._elastic_wait_event_type)
+
+    def test_reinit_without_elastic_wait(self):
+        """Tests that no unpaired end of an elastic wait is recorded."""
+        trainer = self._restorable_trainer()
+        SpmdTrainer._on_restore(trainer)
+        self.assertEqual([], self._elastic_wait_calls(trainer))
+        trainer._maybe_record_event.assert_any_call(measurement.Event.START_ELASTIC_REINIT)
+        trainer._maybe_record_event.assert_any_call(measurement.Event.END_ELASTIC_REINIT)
+        # Slice counts at the start and end of the reinit.
+        self.assertEqual(2, trainer._record_slice_counts.call_count)
+
+    @parameterized.parameters(
+        dict(restore_raises=False, expected=["START", "END"]),
+        # A failed restore is not recorded as completed.
+        dict(restore_raises=True, expected=["START"]),
+    )
+    def test_snapshot_restore_event(self, restore_raises: bool, expected: list[str]):
+        trainer = unittest.mock.MagicMock()
+        trainer.snapshotter.restore.side_effect = RuntimeError if restore_raises else None
+        trainer.snapshotter.restore.return_value = (10, {})
+        with self.assertRaises(RuntimeError) if restore_raises else contextlib.nullcontext():
+            self.assertEqual((10, {}), SpmdTrainer._restore_snapshot(trainer))
+        trainer.snapshotter.restore.assert_called_once_with(
+            state=trainer._trainer_state_specs._asdict()
+        )
+        snapshot_events = [
+            c.args[0].value.split("_")[0]
+            for c in trainer._maybe_record_event.call_args_list
+            if c.kwargs.get("custom_badput_event_type") == "SNAPSHOT_RESTORE"
+        ]
+        self.assertEqual(expected, snapshot_events)
+
+    @parameterized.parameters(dict(snapshot=True), dict(snapshot=False))
+    def test_reinit_setup_events(self, snapshot: bool):
+        """Tests the accelerator init and training preparation nested in the reinitialization."""
+        trainer = unittest.mock.MagicMock()
+        trainer._trainer_state = None
+        trainer._elastic_wait_event_type = "elastic_slice_down"
+        # The snapshot is tried first; the checkpoint is the fallback.
+        state = dict(prng_key=None, model=None, learner=None)
+        trainer._restore_snapshot.return_value = (10, state) if snapshot else (None, None)
+        trainer.restore_checkpoint.return_value = 20
+
+        SpmdTrainer._on_restore(trainer)
+
+        # Records the events and the steps of the reinitialization in the order they happen.
+        def name(c) -> Optional[str]:
+            method, args, _ = c
+            if method == "_maybe_record_event" and args[0] != measurement.Event.RECORD_SLICE_COUNTS:
+                return args[0].value
+            if method in (
+                "checkpointer.cancel",
+                "_restore_snapshot",
+                "restore_checkpoint",
+                "save_snapshot",
+            ):
+                return method
+            return None
+
+        restores = ["_restore_snapshot"] if snapshot else ["_restore_snapshot", "restore_checkpoint"]
+        self.assertEqual(
+            [
+                "END_ELASTIC_WAIT",
+                "START_ELASTIC_REINIT",
+                "START_ACCELERATOR_INIT",
+                "END_ACCELERATOR_INIT",
+                "START_TRAINING_PREPARATION",
+                "checkpointer.cancel",
+                *restores,
+                "END_TRAINING_PREPARATION",
+                # Like MaxText, the snapshot is saved after the training preparation.
+                "save_snapshot",
+                "END_ELASTIC_REINIT",
+            ],
+            [n for n in map(name, trainer.mock_calls) if n is not None],
+        )
+        trainer.save_snapshot.assert_called_once_with(force=True)
+
+    def test_create_input_iterator(self):
+        trainer = unittest.mock.MagicMock()
+        trainer.input.dataset.return_value = [1, 2]
+        input_iter = SpmdTrainer._create_input_iterator(trainer)
+        self.assertEqual([1, 2], list(input_iter))
+        self.assertEqual(
+            [
+                unittest.mock.call(
+                    measurement.Event.START_CUSTOM_BADPUT_EVENT,
+                    custom_badput_event_type="DATA_ITERATOR_INIT",
+                ),
+                unittest.mock.call(
+                    measurement.Event.END_CUSTOM_BADPUT_EVENT,
+                    custom_badput_event_type="DATA_ITERATOR_INIT",
+                ),
+            ],
+            trainer._maybe_record_event.call_args_list,
+        )
+
+    @parameterized.parameters(
+        dict(stepping=True, available=3, expected=(2, 2)),
+        dict(stepping=False, available=3, expected=(0, 3)),
+        # If the available slices cannot be checked, the active slices are reported.
+        dict(stepping=False, available=None, expected=(0, 2)),
+    )
+    def test_record_slice_counts(
+        self, stepping: bool, available: Optional[int], expected: tuple[int, int]
+    ):
+        trainer = unittest.mock.MagicMock()
+        manager = unittest.mock.MagicMock(active_slice_count=2, total_slice_count=4)
+        with (
+            unittest.mock.patch.object(elastic_utils, "elastic_manager", manager),
+            unittest.mock.patch.object(
+                elastic_utils, "available_slice_count", return_value=available
+            ),
+        ):
+            SpmdTrainer._record_slice_counts(trainer, stepping=stepping)
+        trainer._maybe_record_event.assert_called_once_with(
+            measurement.Event.RECORD_SLICE_COUNTS,
+            active_slices=expected[0],
+            total_slices=4,
+            available_slices=expected[1],
+        )
 
 
 class SelectMeshConfigTest(test_utils.TestCase):
