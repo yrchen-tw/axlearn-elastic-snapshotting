@@ -44,6 +44,7 @@ def _create_manager(*, poll_interval: float) -> manager.Manager:
     Released pathwaysutils (pinned to 0.1.11; latest 0.1.13) has no
     `Manager(wait_for_slices=..., poll_interval=...)`, so wait explicitly there.
     """
+    elastic_utils.install_elastic_event_cleanup()
     if "wait_for_slices" in inspect.signature(manager.Manager).parameters:
         return manager.Manager(wait_for_slices=True, poll_interval=poll_interval)
     mgr = manager.Manager()
