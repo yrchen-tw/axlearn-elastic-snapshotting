@@ -497,6 +497,28 @@ def get_trainer_kwargs(
                     ),
                 ),
                 (
+                    # Run-only: multi-slice v6e (e.g. 2 x tpu-v6e-8) with Orbax checkpoints, as
+                    # for 70B on tpu-v5p.
+                    "tpu-v6e-(8|16)",
+                    ChainConfigModifier.default_config().set(
+                        config_modifiers=[
+                            MeshShapeModifier.default_config().set(
+                                mesh_shape=HybridMeshShape(
+                                    ici_mesh_shape=mesh_shape_from_axes(fsdp=-1),
+                                    dcn_mesh_shape=mesh_shape_from_axes(data=-1),
+                                )
+                            ),
+                            V6eFlashConfigModifier.default_config(),
+                            ModuleConfigModifier.default_config().set(
+                                target_config="checkpointer",
+                                modification=OrbaxCheckpointer.default_config().set(
+                                    max_concurrent_save_gb=16
+                                ),
+                            ),
+                        ],
+                    ),
+                ),
+                (
                     "tpu-v5p-.*",
                     ChainConfigModifier.default_config().set(
                         config_modifiers=[
