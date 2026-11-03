@@ -33,6 +33,7 @@ from axlearn.common.attention import (
     StackedTransformerLayer,
 )
 from axlearn.common.base_layer import RematSpec
+from axlearn.common.checkpointer_orbax import OrbaxCheckpointer
 from axlearn.common.config import TrainerConfigFn, config_for_function
 from axlearn.common.decoder import LmHead
 from axlearn.common.embedding import TransformerTextEmbeddings
@@ -728,6 +729,13 @@ def get_trainer_kwargs(
                                     k: {"param_partition_spec": ("model", ("expert", "fsdp", "seq"))}
                                     for k in ("model.decoder.emb.token_emb", "model.decoder.lm_head")
                                 },
+                            ),
+                            # Run-only: checkpoint with Orbax, as before pause-and-resume dropped it.
+                            ModuleConfigModifier.default_config().set(
+                                target_config="checkpointer",
+                                modification=OrbaxCheckpointer.default_config().set(
+                                    max_concurrent_save_gb=16
+                                ),
                             ),
                         ],
                     ),
