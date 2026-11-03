@@ -2,13 +2,45 @@
 
 """Elastic training utilities for the Pathways backend (no-ops on McJAX)."""
 
+import contextlib
 from typing import Optional
 
+import jax
 from absl import logging
 from pathwaysutils.elastic import elastic, manager
 
 # The elastic manager of the `Snapshotter`, set when it is created on Pathways.
 elastic_manager: Optional[manager.Manager] = None
+
+
+def _is_host_array(array: jax.Array) -> bool:
+    sharding = getattr(array, "sharding", None)
+    if getattr(sharding, "memory_kind", None) in ("pinned_host", "unpinned_host"):
+        return True
+    return any(getattr(d, "platform", None) == "cpu" for d in getattr(sharding, "device_set", ()))
+
+
+def _elastic_event_cleanup() -> None:
+    """Like `manager._elastic_event_cleanup`, but keeps host arrays such as the snapshot.
+
+    The released cleanup deletes every live array after a slice-down, so the snapshot restore that
+    follows fails with "Input array #0 has been donated or deleted".
+    """
+    try:
+        jax.profiler.stop_trace()
+    except (RuntimeError, ValueError):
+        pass
+    jax.clear_caches()
+    for array in jax.live_arrays():
+        if _is_host_array(array):
+            continue
+        with contextlib.suppress(Exception):
+            array.delete()
+
+
+def install_elastic_event_cleanup():
+    """Makes `Manager.elastic_retry` keep host-resident snapshots. Idempotent."""
+    manager._elastic_event_cleanup = _elastic_event_cleanup  # pylint: disable=protected-access
 
 
 def elastic_enabled() -> bool:
