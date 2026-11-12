@@ -21,13 +21,11 @@
 """
 
 import contextlib
-import functools
 import os
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Optional, Sequence
 
 import jax
 from absl import flags, logging
-from ml_goodput_measurement import goodput
 from ml_goodput_measurement import monitoring as goodput_monitoring
 from ml_goodput_measurement.src import goodput_elastic, monitoring_elastic
 
@@ -59,10 +57,6 @@ class GoodputRecorder(measurement_base.Recorder):
             enable_checkpoint_logging: Whether to log Orbax checkpoint statistics for goodput.
             enable_gcp_goodput_metrics: Whether to upload goodput metrics to Google Cloud
                 Monitoring.
-            enable_gcp_step_deviation_metrics: Whether to upload step deviation metrics to Google
-                Cloud Monitoring.
-            include_step_deviation: Whether to compute and upload the step time deviation.
-            step_deviation_interval_seconds: Time interval (seconds) for step deviation uploads.
         """
 
         upload_dir: Required[str] = REQUIRED
@@ -73,9 +67,6 @@ class GoodputRecorder(measurement_base.Recorder):
         enable_monitoring: bool = True
         enable_checkpoint_logging: bool = True
         enable_gcp_goodput_metrics: bool = True
-        enable_gcp_step_deviation_metrics: bool = True
-        include_step_deviation: bool = False
-        step_deviation_interval_seconds: int = 30
 
     @classmethod
     def from_flags(cls, fv: flags.FlagValues) -> "GoodputRecorder":
@@ -94,38 +85,25 @@ class GoodputRecorder(measurement_base.Recorder):
         - enable_checkpoint_logging: Boolean to enable/disable checkpoint logging (default: true).
         - enable_gcp_goodput_metrics: Boolean to enable/disable goodput metrics in Google Cloud
             Monitoring (default: true).
-        - enable_gcp_step_deviation_metrics: Boolean to enable/disable step deviation metrics in
-            Google Cloud Monitoring (default: true).
-        - include_step_deviation: Boolean to enable/disable step deviation monitoring
-            (default: false).
-        - step_deviation_interval_seconds: The time interval in seconds at which to query and
-            upload the step deviation (default: 30).
         """
         cfg: measurement_base.Recorder.Config = cls.default_config()
         parsed_flags = parse_kv_flags(fv.recorder_spec, delimiter="=")
-        for key in ("upload_interval", "step_deviation_interval_seconds"):
-            if key in parsed_flags:
-                parsed_flags[key] = int(parsed_flags[key])
+        if "upload_interval" in parsed_flags:
+            parsed_flags["upload_interval"] = int(parsed_flags["upload_interval"])
         if "rolling_window_size" in parsed_flags and isinstance(
             parsed_flags["rolling_window_size"], str
         ):
             parsed_flags["rolling_window_size"] = [
                 int(x) for x in parsed_flags["rolling_window_size"].split(",")
             ]
-        for key in (
-            "enable_monitoring",
-            "enable_checkpoint_logging",
-            "enable_gcp_goodput_metrics",
-            "enable_gcp_step_deviation_metrics",
-            "include_step_deviation",
-        ):
+        for key in ("enable_monitoring", "enable_checkpoint_logging", "enable_gcp_goodput_metrics"):
             if key in parsed_flags:
                 parsed_flags[key] = to_bool(parsed_flags[key])
         return maybe_set_config(cfg, **parsed_flags).instantiate()
 
     def __init__(self, cfg):
         super().__init__(cfg)
-        self._recorder: Optional[goodput.GoodputRecorder] = None
+        self._recorder: Optional[goodput_elastic.ElasticGoodputRecorder] = None
         self._monitor: Optional[goodput_monitoring.GoodputMonitor] = None
         self._rolling_window_monitor: Optional[goodput_monitoring.GoodputMonitor] = None
         self._job_name = cfg.name
@@ -159,24 +137,31 @@ class GoodputRecorder(measurement_base.Recorder):
         logging.info("Successfully set up checkpoint cloud logger: %s", self._logger_name)
         return checkpoint_logger
 
-    @contextlib.contextmanager
-    def record_event(self, event: measurement_base.EventType, *args, **kwargs):
-        """Records a goodput event using a context manager."""
-        # Lazily instantiate the recorder if it hasn't been already.
+    def _get_recorder(self) -> goodput_elastic.ElasticGoodputRecorder:
+        """Returns the goodput recorder, which is created lazily to not invoke jax before setup.
+
+        Both `record()` and `record_event()` use it. The elastic recorder also records the elastic
+        events and works for non-elastic jobs.
+        """
         if self._recorder is None:
             if jax.process_index() == 0:
                 logging.info("Lazily instantiating goodput recorder.")
-            self._recorder = goodput.GoodputRecorder(
+            self._recorder = goodput_elastic.ElasticGoodputRecorder(
                 job_name=self._job_name,
                 logger_name=self._logger_name,
                 logging_enabled=(jax.process_index() == 0),
             )
+        return self._recorder
 
+    @contextlib.contextmanager
+    def record_event(self, event: measurement_base.EventType, *args, **kwargs):
+        """Records a goodput event using a context manager."""
+        recorder = self._get_recorder()
         start_method_name = f"record_{event.value}_start_time"
         end_method_name = f"record_{event.value}_end_time"
 
-        record_event_start = getattr(self._recorder, start_method_name, None)
-        record_event_end = getattr(self._recorder, end_method_name, None)
+        record_event_start = getattr(recorder, start_method_name, None)
+        record_event_end = getattr(recorder, end_method_name, None)
 
         if record_event_start:
             try:
@@ -200,20 +185,42 @@ class GoodputRecorder(measurement_base.Recorder):
                     )
         # pylint: enable=try-except-raise
 
-    def _monitor_class(self) -> Callable[..., goodput_monitoring.GoodputMonitor]:
-        """Returns the goodput monitor class, with the slice efficiency for elastic jobs."""
+    def _create_monitor(self, tensorboard_dir: str) -> goodput_monitoring.GoodputMonitor:
+        """Creates a goodput monitor, with the slice efficiency for elastic jobs.
+
+        As in MaxText, falls back to the base monitor if the elastic monitor cannot be created.
+        """
         # Imported lazily, since it imports pathwaysutils.
         # pylint: disable-next=import-outside-toplevel
         from axlearn.common import elastic_utils
 
+        kwargs = dict(
+            job_name=self._job_name,
+            logger_name=self._logger_name,
+            tensorboard_dir=tensorboard_dir,
+            upload_interval=self.config.upload_interval,
+            monitoring_enabled=True,
+            include_badput_breakdown=True,
+            **self._monitor_options(),
+        )
+        pathway_enabled = self.config.jax_backend == "proxy"
         # The trainer creates the elastic manager before monitoring starts.
         if elastic_utils.elastic_enabled():
-            return functools.partial(
-                monitoring_elastic.ElasticGoodputMonitor, include_slice_efficiency=True
-            )
-        return functools.partial(
-            goodput_monitoring.GoodputMonitor, pathway_enabled=self.config.jax_backend == "proxy"
-        )
+            try:
+                monitor = monitoring_elastic.ElasticGoodputMonitor(
+                    include_slice_efficiency=True, **kwargs
+                )
+                logging.info("Goodput: using ElasticGoodputMonitor for %s.", tensorboard_dir)
+                return monitor
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                logging.warning(
+                    "Failed to create the elastic goodput monitor, using the base monitor: %s", e
+                )
+            # Elastic training runs on Pathways.
+            pathway_enabled = True
+        monitor = goodput_monitoring.GoodputMonitor(pathway_enabled=pathway_enabled, **kwargs)
+        logging.info("Goodput: using GoodputMonitor for %s.", tensorboard_dir)
+        return monitor
 
     @contextlib.contextmanager
     def _maybe_monitor_goodput(self, *args, **kwargs):
@@ -235,43 +242,21 @@ class GoodputRecorder(measurement_base.Recorder):
             return
         try:
             if self._monitor is None:
-                self._monitor = self._monitor_class()(
-                    job_name=self._job_name,
-                    logger_name=self._logger_name,
-                    tensorboard_dir=self.config.upload_dir,
-                    upload_interval=self.config.upload_interval,
-                    monitoring_enabled=True,
-                    include_badput_breakdown=True,
-                    **self._monitor_options(step_deviation=True),
-                )
+                self._monitor = self._create_monitor(self.config.upload_dir)
 
             self._monitor.start_goodput_uploader(*args, **kwargs)
             logging.info("Started Goodput upload to Tensorboard & GCM in the background!")
-            if self.config.include_step_deviation:
-                self._monitor.start_step_deviation_uploader()
             yield
         finally:
             if self._monitor:
                 self._monitor.stop_goodput_uploader()
-                if self.config.include_step_deviation:
-                    self._monitor.stop_step_deviation_uploader()
                 logging.info("Flushed final metrics and safe exited from Goodput monitoring.")
 
-    def _monitor_options(self, *, step_deviation: bool = False) -> dict[str, Any]:
+    def _monitor_options(self) -> dict[str, Any]:
         """Returns the monitor arguments that differ from the library defaults."""
-        cfg: GoodputRecorder.Config = self.config
-        options = {}
-        if not (cfg.enable_gcp_goodput_metrics and cfg.enable_gcp_step_deviation_metrics):
-            options["gcp_options"] = goodput_monitoring.GCPOptions(
-                enable_gcp_goodput_metrics=cfg.enable_gcp_goodput_metrics,
-                enable_gcp_step_deviation_metrics=cfg.enable_gcp_step_deviation_metrics,
-            )
-        if step_deviation and cfg.include_step_deviation:
-            options.update(
-                include_step_deviation=True,
-                step_deviation_interval_seconds=cfg.step_deviation_interval_seconds,
-            )
-        return options
+        if self.config.enable_gcp_goodput_metrics:
+            return {}
+        return dict(gcp_options=goodput_monitoring.GCPOptions(enable_gcp_goodput_metrics=False))
 
     @contextlib.contextmanager
     def _maybe_monitor_rolling_window_goodput(self):
@@ -288,15 +273,7 @@ class GoodputRecorder(measurement_base.Recorder):
                 rolling_window_tensorboard_dir = os.path.join(
                     self.config.upload_dir, f"rolling_window_{self.config.name}"
                 )
-                self._rolling_window_monitor = self._monitor_class()(
-                    job_name=self._job_name,
-                    logger_name=self._logger_name,
-                    tensorboard_dir=rolling_window_tensorboard_dir,
-                    upload_interval=self.config.upload_interval,
-                    monitoring_enabled=True,
-                    include_badput_breakdown=True,
-                    **self._monitor_options(),
-                )
+                self._rolling_window_monitor = self._create_monitor(rolling_window_tensorboard_dir)
             self._rolling_window_monitor.start_rolling_window_goodput_uploader(
                 self.config.rolling_window_size
             )
@@ -331,51 +308,53 @@ class GoodputRecorder(measurement_base.Recorder):
         return monitor_goodput()
 
     def record(self, event: measurement_base.Event, *args, **kwargs):
-        """Deprecated: `record()` is not used in GoodputRecorder.
-        Use the record_event context manager instead.
+        """Records a goodput event.
+
+        Goodput is best effort: a failure to record an event, e.g. in an elastic recovery callback,
+        is logged and never fails training.
         """
-        # Lazily instantiate the recorder. This avoids invoking jax before setup is complete.
-        if self._recorder is None:
-            cfg: GoodputRecorder.Config = self.config
-            self._recorder = goodput_elastic.ElasticGoodputRecorder(
-                job_name=cfg.name,
-                logger_name=f"goodput_logger_{cfg.name}",
-                logging_enabled=(jax.process_index() == 0),
+        try:
+            self._record(event, *args, **kwargs)
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logging.log_every_n_seconds(
+                logging.WARNING, "Failed to record goodput event %s: %s", 60, event, e
             )
 
+    def _record(self, event: measurement_base.Event, *args, **kwargs):
+        recorder = self._get_recorder()
         if event == measurement_base.Event.START_JOB:
-            self._recorder.record_job_start_time(*args, **kwargs)
+            recorder.record_job_start_time(*args, **kwargs)
         elif event == measurement_base.Event.END_JOB:
-            self._recorder.record_job_end_time(*args, **kwargs)
+            recorder.record_job_end_time(*args, **kwargs)
             self.flush()
         elif event == measurement_base.Event.START_STEP:
-            self._recorder.record_step_start_time(*args, **kwargs)
+            recorder.record_step_start_time(*args, **kwargs)
         elif event == measurement_base.Event.START_ACCELERATOR_INIT:
-            self._recorder.record_tpu_init_start_time(*args, **kwargs)
+            recorder.record_tpu_init_start_time(*args, **kwargs)
         elif event == measurement_base.Event.END_ACCELERATOR_INIT:
-            self._recorder.record_tpu_init_end_time(*args, **kwargs)
+            recorder.record_tpu_init_end_time(*args, **kwargs)
         elif event == measurement_base.Event.START_TRAINING_PREPARATION:
-            self._recorder.record_training_preparation_start_time(*args, **kwargs)
+            recorder.record_training_preparation_start_time(*args, **kwargs)
         elif event == measurement_base.Event.END_TRAINING_PREPARATION:
-            self._recorder.record_training_preparation_end_time(*args, **kwargs)
+            recorder.record_training_preparation_end_time(*args, **kwargs)
         elif event == measurement_base.Event.START_DATA_LOADING:
-            self._recorder.record_data_loading_start_time(*args, **kwargs)
+            recorder.record_data_loading_start_time(*args, **kwargs)
         elif event == measurement_base.Event.END_DATA_LOADING:
-            self._recorder.record_data_loading_end_time(*args, **kwargs)
+            recorder.record_data_loading_end_time(*args, **kwargs)
         elif event == measurement_base.Event.START_CUSTOM_BADPUT_EVENT:
-            self._recorder.record_custom_badput_event_start_time(*args, **kwargs)
+            recorder.record_custom_badput_event_start_time(*args, **kwargs)
         elif event == measurement_base.Event.END_CUSTOM_BADPUT_EVENT:
-            self._recorder.record_custom_badput_event_end_time(*args, **kwargs)
+            recorder.record_custom_badput_event_end_time(*args, **kwargs)
         elif event == measurement_base.Event.START_ELASTIC_WAIT:
-            self._recorder.record_elastic_wait_start_time(*args, **kwargs)
+            recorder.record_elastic_wait_start_time(*args, **kwargs)
         elif event == measurement_base.Event.END_ELASTIC_WAIT:
-            self._recorder.record_elastic_wait_end_time(*args, **kwargs)
+            recorder.record_elastic_wait_end_time(*args, **kwargs)
         elif event == measurement_base.Event.START_ELASTIC_REINIT:
-            self._recorder.record_elastic_reinit_start_time(*args, **kwargs)
+            recorder.record_elastic_reinit_start_time(*args, **kwargs)
         elif event == measurement_base.Event.END_ELASTIC_REINIT:
-            self._recorder.record_elastic_reinit_end_time(*args, **kwargs)
+            recorder.record_elastic_reinit_end_time(*args, **kwargs)
         elif event == measurement_base.Event.RECORD_SLICE_COUNTS:
-            self._recorder.record_elastic_slice_counts(*args, **kwargs)
+            recorder.record_elastic_slice_counts(*args, **kwargs)
         else:
             logging.log_first_n(
                 logging.WARNING,

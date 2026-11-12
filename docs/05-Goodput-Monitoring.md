@@ -143,12 +143,10 @@ axlearn gcp launch run --instance_type=tpu-v5litepod-16 \
 | `enable_monitoring` | `true` | Enables the background uploaders. Recording is always on. |
 | `enable_checkpoint_logging` | `true` | Logs Orbax checkpoint statistics to the goodput log (see below). |
 | `enable_gcp_goodput_metrics` | `true` | Uploads goodput metrics to Google Cloud Monitoring. |
-| `enable_gcp_step_deviation_metrics` | `true` | Uploads step deviation metrics to Google Cloud Monitoring. |
-| `include_step_deviation` | `false` | Computes and uploads the step time deviation. |
-| `step_deviation_interval_seconds` | `30` | Seconds between step deviation uploads. |
 
-Elastic jobs (with a Pathways elastic manager) use the elastic monitor, which also uploads the
-slice efficiency.
+The goodput uploader also uploads the step time deviation. Elastic jobs (with a Pathways elastic
+manager) use the elastic monitor, which also uploads the slice efficiency; if it cannot be created,
+the base monitor is used.
 
 ### Recorded Events
 
@@ -165,6 +163,8 @@ Besides the job, step, accelerator initialization, training preparation and data
 | Input iterator creation | Custom badput `DATA_ITERATOR_INIT`, at init and when a checkpoint restore rebuilds it. |
 | Compilation | Custom badput `COMPILATION_NO_XSC` / `COMPILATION_WITH_XSC`. |
 | Evaluation | Custom badput `EVAL`, at steps where an evaler ran. |
+
+A failure to record an event is logged and never fails training or an elastic recovery.
 
 ### Checkpoint Badput
 
@@ -188,8 +188,7 @@ the same goodput timeline. The recorder is flushed on every exit path.
 By default, when Goodput monitoring is enabled via the recorder, AXLearn automatically pushes metrics to Google Cloud Monitoring.
 
 -   **Cumulative Metrics** are enabled by default when you specify the `recorder_type`.
-    To disable this, set `--recorder_spec=enable_gcp_goodput_metrics=false` (and
-    `enable_gcp_step_deviation_metrics=false` for the step deviation metrics).
+    To disable this, set `--recorder_spec=enable_gcp_goodput_metrics=false`.
 -   **Rolling Window Metrics** can be explicitly enabled by providing window sizes
     via `rolling_window_size`.
 
