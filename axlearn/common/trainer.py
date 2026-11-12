@@ -1003,7 +1003,7 @@ class SpmdTrainer(Module):
             self._maybe_record_event(measurement.Event.END_ELASTIC_WAIT, "elastic_slice_down")
             self._in_elastic_wait = False
         self._maybe_record_event(measurement.Event.START_ELASTIC_REINIT)
-        self._record_slice_counts()
+        self._record_slice_counts(in_elastic_event=True)
         self._maybe_record_event(measurement.Event.START_ACCELERATOR_INIT)
         self._step_log(
             "[ELASTIC][SCALE] devices=%s unchanged; reusing mesh.", len(self._mesh.devices.flat)

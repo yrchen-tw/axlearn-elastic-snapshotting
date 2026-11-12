@@ -57,7 +57,7 @@ class OrbaxCheckpointerTest(test_utils.TestCase):
             self.assertEqual(ref_index, test_index["index"])
 
     def test_logger(self):
-        """Tests that checkpoint statistics are logged and that logging errors fail no restore."""
+        """Tests that checkpoint statistics are logged and logging errors fail no save/restore."""
         mesh_shape = (1, 1)
         if not test_utils.is_supported_mesh_shape(mesh_shape):
             return
@@ -65,10 +65,10 @@ class OrbaxCheckpointerTest(test_utils.TestCase):
         class _ListLogger(ocp.logging.AbstractLogger):
             def __init__(self):
                 self.entries = []
-                self.fail_restore = False
+                self.fail = False
 
             def log_entry(self, entry):
-                if self.fail_restore and entry["event_type"] == "restore":
+                if self.fail:
                     raise RuntimeError("Cloud Logging unavailable")
                 self.entries.append(entry)
 
@@ -87,13 +87,19 @@ class OrbaxCheckpointerTest(test_utils.TestCase):
             self.assertIn("checkpoint_manager_blocking_start_time", logger.entries[0])
             self.assertIn("checkpoint_manager_start_time", logger.entries[1])
 
-            logger.fail_restore = True
+            logger.fail = True
             with mock.patch.object(checkpointer_orbax.logging, "warning") as mock_warning:
-                step, restored = ckpt.restore(step=1, state=state)
-            self.assertEqual(1, step)
+                ckpt.save(step=2, state=state)
+                ckpt.wait_until_finished()
+                step, restored = ckpt.restore(step=2, state=state)
+            self.assertEqual(2, step)
             self.assertNestedAllClose(state, restored)
-            mock_warning.assert_any_call(
-                "Failed to log checkpoint restore statistics: %s", mock.ANY
+            # Both the save and the restore entries failed to log.
+            self.assertEqual(
+                2,
+                mock_warning.call_args_list.count(
+                    mock.call("Failed to log checkpoint statistics: %s", mock.ANY)
+                ),
             )
 
     def test_checkpoint_manager_with_tracker_file(self):

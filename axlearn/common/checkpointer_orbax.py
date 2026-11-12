@@ -326,19 +326,21 @@ class _CheckpointManagerWithTrackerFile(ocp.CheckpointManager):
                 self.tracker_file_path.write_text(str(step))
 
 
-class _RestoreSafeLogger(ocp.logging.AbstractLogger):
-    """Wraps a logger so that failing to log restore statistics never fails the restore."""
+class _SafeLogger(ocp.logging.AbstractLogger):
+    """Wraps a logger so that failing to log never fails a checkpoint save or restore.
+
+    Orbax calls `log_entry` without a guard, e.g. at the end of `CheckpointManager.save()`, and
+    loggers such as `CloudLogger` log synchronously.
+    """
 
     def __init__(self, logger: ocp.logging.AbstractLogger):
         self._logger = logger
 
-    def log_entry(self, entry: Any):
+    def log_entry(self, entry: Any, *args, **kwargs):
         try:
-            self._logger.log_entry(entry)
+            self._logger.log_entry(entry, *args, **kwargs)
         except Exception as e:  # pylint: disable=broad-exception-caught
-            if not (isinstance(entry, dict) and entry.get("event_type") == "restore"):
-                raise
-            logging.warning("Failed to log checkpoint restore statistics: %s", e)
+            logging.warning("Failed to log checkpoint statistics: %s", e)
 
 
 class OrbaxCheckpointer(BaseCheckpointer):
@@ -452,7 +454,7 @@ class OrbaxCheckpointer(BaseCheckpointer):
             cfg.logger
         )
         if self._checkpoint_logger is not None:
-            self._checkpoint_logger = _RestoreSafeLogger(self._checkpoint_logger)
+            self._checkpoint_logger = _SafeLogger(self._checkpoint_logger)
         CheckpointManager = (  # pylint: disable=invalid-name
             _CheckpointManagerWithTrackerFile
             if cfg.read_latest_checkpoint_from_tracker_file

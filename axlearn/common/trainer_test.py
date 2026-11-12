@@ -1443,8 +1443,11 @@ class ElasticGoodputEventsTest(test_utils.TestCase):
         trainer._maybe_record_event.assert_any_call(
             measurement.Event.START_CUSTOM_BADPUT_EVENT, custom_badput_event_type="SNAPSHOT_RESTORE"
         )
-        # Slice counts at the start and end of the reinit.
-        self.assertEqual(2, trainer._record_slice_counts.call_count)
+        # Slice counts at the start and end of the reinit. Nothing steps until END_ELASTIC_REINIT.
+        self.assertEqual(
+            [unittest.mock.call(in_elastic_event=True), unittest.mock.call()],
+            trainer._record_slice_counts.call_args_list,
+        )
 
     def test_create_input_iterator(self):
         trainer = unittest.mock.MagicMock()
